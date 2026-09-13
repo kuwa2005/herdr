@@ -112,8 +112,12 @@ fn parse_legacy_key_sequence(data: &str) -> Option<TerminalKey> {
         "\r" => Some(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty())),
         "\t" => Some(TerminalKey::new(KeyCode::Tab, KeyModifiers::empty())),
         "\x1b" => Some(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty())),
-        "\x1b\x7f" => Some(TerminalKey::new(KeyCode::Backspace, KeyModifiers::ALT)),
-        "\x7f" => Some(TerminalKey::new(KeyCode::Backspace, KeyModifiers::empty())),
+        // 0x08 is BS / Ctrl+H. Hosts that use backarrow mode or map Backspace to
+        // CTRL-H (notably MobaXterm) deliver it for the Backspace key. Prefer
+        // Backspace over Char('h')+CONTROL so Kitty re-encoding does not insert
+        // literal `h` into panes that consume CSI-u (refs #3244).
+        "\x1b\x08" | "\x1b\x7f" => Some(TerminalKey::new(KeyCode::Backspace, KeyModifiers::ALT)),
+        "\x08" | "\x7f" => Some(TerminalKey::new(KeyCode::Backspace, KeyModifiers::empty())),
         _ if data.starts_with('\x1b') => {
             let rest = data.strip_prefix('\x1b')?;
             if rest.chars().count() == 1 {
@@ -147,7 +151,9 @@ fn parse_legacy_key_sequence(data: &str) -> Option<TerminalKey> {
 fn parse_legacy_ctrl_char(ch: char) -> Option<TerminalKey> {
     match ch as u32 {
         0 => Some(TerminalKey::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
-        1..=26 => Some(TerminalKey::new(
+        // Skip 8 (BS): handled as Backspace in parse_legacy_key_sequence.
+        // Skip 9 (HT) and 13 (CR): handled as Tab / Enter there as well.
+        1..=7 | 10..=12 | 14..=26 => Some(TerminalKey::new(
             KeyCode::Char(char::from_u32((ch as u32) + 96)?),
             KeyModifiers::CONTROL,
         )),
@@ -821,6 +827,35 @@ mod tests {
         let key = parse_terminal_key_sequence("\x1b\x7f").unwrap();
         assert_eq!(key.code, KeyCode::Backspace);
         assert_eq!(key.modifiers, KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn parse_legacy_bs_byte_as_backspace() {
+        let key = parse_terminal_key_sequence("\x08").unwrap();
+        assert_eq!(key.code, KeyCode::Backspace);
+        assert_eq!(key.modifiers, KeyModifiers::empty());
+    }
+
+    #[test]
+    fn parse_legacy_alt_bs_byte_as_alt_backspace() {
+        let key = parse_terminal_key_sequence("\x1b\x08").unwrap();
+        assert_eq!(key.code, KeyCode::Backspace);
+        assert_eq!(key.modifiers, KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn legacy_bs_backspace_reencodes_as_del_not_ctrl_h_csi_u() {
+        // Hosts like MobaXterm deliver Backspace as 0x08. Re-encoding into a
+        // Kitty pane must stay Backspace (DEL / CSI-u 127), never Ctrl+h.
+        let key = parse_terminal_key_sequence("\x08").unwrap();
+        assert_eq!(
+            encode_terminal_key(key.clone(), KeyboardProtocol::Legacy),
+            b"\x7f"
+        );
+        assert_eq!(
+            encode_terminal_key(key, KeyboardProtocol::Kitty { flags: 1 }),
+            b"\x7f"
+        );
     }
 
     #[test]
