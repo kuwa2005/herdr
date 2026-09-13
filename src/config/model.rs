@@ -125,6 +125,37 @@ impl StatusIndicatorStyle {
     }
 }
 
+/// UI language for Herdr chrome (menus, settings, overlays).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiLanguage {
+    #[default]
+    En,
+    Ja,
+    ZhCn,
+}
+
+impl UiLanguage {
+    pub const ALL: &[Self] = &[Self::En, Self::Ja, Self::ZhCn];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ja => "ja",
+            Self::ZhCn => "zh-cn",
+        }
+    }
+
+    /// Native-script label shown in the language picker (not translated).
+    pub fn native_label(self) -> &'static str {
+        match self {
+            Self::En => "English",
+            Self::Ja => "日本語",
+            Self::ZhCn => "简体中文",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HostCursorModeConfig {
@@ -962,6 +993,9 @@ pub struct UiConfig {
     _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
     /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
     pub status_indicators: StatusIndicatorStyle,
+    /// UI language for menus, settings, and overlays. Saved values are "en", "ja", or "zh-cn".
+    /// Default: "en".
+    pub language: UiLanguage,
     /// Expanded sidebar row composition.
     pub sidebar: SidebarConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1186,6 +1220,7 @@ impl Default for UiConfig {
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             _legacy_agent_panel_scope: None,
             status_indicators: StatusIndicatorStyle::Dots,
+            language: UiLanguage::En,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -1445,6 +1480,17 @@ status_indicators = "symbols"
         )
         .unwrap();
         assert_eq!(config.ui.status_indicators, StatusIndicatorStyle::Symbols);
+    }
+
+    #[test]
+    fn ui_language_parses_known_values() {
+        assert_eq!(Config::default().ui.language, UiLanguage::En);
+
+        let ja: Config = toml::from_str("[ui]\nlanguage = \"ja\"").unwrap();
+        assert_eq!(ja.ui.language, UiLanguage::Ja);
+
+        let zh: Config = toml::from_str("[ui]\nlanguage = \"zh-cn\"").unwrap();
+        assert_eq!(zh.ui.language, UiLanguage::ZhCn);
     }
 
     #[test]

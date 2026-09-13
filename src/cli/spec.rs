@@ -6,6 +6,16 @@ mod completion;
 mod machine;
 
 pub(super) fn command() -> Command {
+    // Unit tests must stay English-stable regardless of the developer config.toml.
+    let language = if cfg!(test) {
+        crate::config::UiLanguage::En
+    } else {
+        crate::i18n::cli::cli_language()
+    };
+    crate::i18n::cli::localize_command(command_en(), language)
+}
+
+fn command_en() -> Command {
     let command = Command::new("herdr")
         .about("terminal workspace manager for AI coding agents")
         .disable_help_flag(true)
@@ -1364,5 +1374,30 @@ mod tests {
             clap_complete::generate(shell, &mut cmd, "herdr", &mut output);
             assert!(!output.is_empty(), "empty {shell:?} completion output");
         }
+    }
+
+    #[test]
+    fn localize_command_translates_root_about_to_japanese() {
+        let cmd = crate::i18n::cli::localize_command(
+            super::command_en(),
+            crate::config::UiLanguage::Ja,
+        );
+        assert_eq!(
+            cmd.get_about().map(|s| s.to_string()).as_deref(),
+            Some("AI コーディングエージェント向けターミナルワークスペースマネージャー")
+        );
+    }
+
+    #[test]
+    fn localize_command_translates_session_help_to_chinese() {
+        let cmd = crate::i18n::cli::localize_command(
+            super::command_en(),
+            crate::config::UiLanguage::ZhCn,
+        );
+        let help = cmd
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("session"))
+            .and_then(|arg| arg.get_help().map(|s| s.to_string()));
+        assert_eq!(help.as_deref(), Some("使用或创建命名持久会话"));
     }
 }

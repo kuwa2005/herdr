@@ -220,7 +220,7 @@ fn context_menus_capture_stable_targets_and_route_actions() {
         })) if workspace_id == "ws_1"
     ));
     let workspace_items = match state.overlay.as_ref() {
-        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(),
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(crate::config::UiLanguage::En),
         _ => panic!("workspace context menu"),
     };
     assert!(workspace_items
@@ -254,7 +254,7 @@ fn context_menus_capture_stable_targets_and_route_actions() {
     state.compose(106, 20).expect("pane context menu");
     let split_index = match state.overlay.as_ref() {
         Some(ClientShellOverlay::ContextMenu(menu)) => menu
-            .items()
+            .items(crate::config::UiLanguage::En)
             .iter()
             .position(|item| item.action == ClientContextMenuAction::SplitRight)
             .expect("split right item"),
@@ -307,11 +307,12 @@ fn global_menu_opens_from_sidebar_and_routes_client_actions() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("settings"));
+    assert!(text.contains("language"));
     assert!(text.contains("keybinds"));
     assert!(text.contains("reload config"));
     assert!(text.contains("detach"));
 
-    let keybinds = state.hits.global_menu_rows[1].0;
+    let keybinds = state.hits.global_menu_rows[2].0;
     let help = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: keybinds.x,
@@ -322,7 +323,7 @@ fn global_menu_opens_from_sidebar_and_routes_client_actions() {
     assert!(matches!(state.overlay, Some(ClientShellOverlay::Help(_))));
 
     state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
-        highlighted: 3,
+        highlighted: 4,
     }));
     let detach = state.handle_input_bytes(b"\r");
     assert!(detach.detach);

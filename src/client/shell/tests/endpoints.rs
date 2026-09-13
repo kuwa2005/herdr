@@ -295,7 +295,7 @@ fn saved_machine_preserves_endpoint_scoped_worktree_collapses() {
     state.open_workspace_context_menu("ws_1".into(), 0, 0);
     let toggle_index = match state.overlay.as_ref() {
         Some(ClientShellOverlay::ContextMenu(menu)) => menu
-            .items()
+            .items(crate::config::UiLanguage::En)
             .iter()
             .position(|item| item.action == ClientContextMenuAction::ToggleGroup)
             .expect("collapse menu item"),

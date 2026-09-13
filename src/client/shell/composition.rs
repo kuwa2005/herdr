@@ -593,8 +593,12 @@ impl ClientShellState {
         if let Some(overlay) = self.overlay.as_ref() {
             let mut composed = frame.to_ratatui_buffer()?;
             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
-                self.hits.context_menu_rows =
-                    render::render_context_menu(&mut composed, menu, &self.config.palette)?;
+                self.hits.context_menu_rows = render::render_context_menu(
+                    &mut composed,
+                    menu,
+                    self.config.language,
+                    &self.config.palette,
+                )?;
                 None
             } else if let ClientShellOverlay::GlobalMenu(menu) = overlay {
                 self.hits.global_menu_rows = render::render_global_menu(
@@ -602,6 +606,7 @@ impl ClientShellState {
                     self.hits.global_launcher,
                     menu,
                     snapshot,
+                    self.config.language,
                     &self.config.palette,
                 )?;
                 None
@@ -613,6 +618,7 @@ impl ClientShellState {
                     &self.endpoints,
                     &self.active_endpoint_id,
                     &self.config.keybinds,
+                    self.config.language,
                     &self.config.palette,
                 )?;
                 self.hits.overlay_primary = rendered.primary;

@@ -1,8 +1,10 @@
 use super::*;
+use crate::i18n::{t, Msg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClientGlobalMenuAction {
     Binding(crate::input::KeybindAction),
+    Language,
     WhatsNew,
 }
 
@@ -21,33 +23,38 @@ pub(super) fn global_menu_item_has_badge(
 
 pub(super) fn global_menu_items(
     snapshot: &ClientShellSnapshot,
+    language: crate::config::UiLanguage,
 ) -> Vec<(&'static str, ClientGlobalMenuAction)> {
     let mut items = vec![
         (
-            "settings",
+            t(language, Msg::MenuSettings),
             ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Settings),
         ),
         (
-            "keybinds",
+            t(language, Msg::MenuLanguage),
+            ClientGlobalMenuAction::Language,
+        ),
+        (
+            t(language, Msg::MenuKeybinds),
             ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Help),
         ),
         (
-            "reload config",
+            t(language, Msg::MenuReloadConfig),
             ClientGlobalMenuAction::Binding(crate::input::KeybindAction::ReloadConfig),
         ),
     ];
     if snapshot.update_available.is_some() || snapshot.latest_release_notes_available {
         items.push((
             if snapshot.update_available.is_some() {
-                "update ready"
+                t(language, Msg::MenuUpdateReady)
             } else {
-                "what's new"
+                t(language, Msg::MenuWhatsNew)
             },
             ClientGlobalMenuAction::WhatsNew,
         ));
     }
     items.push((
-        "detach",
+        t(language, Msg::MenuDetach),
         ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Detach),
     ));
     items
@@ -68,8 +75,8 @@ impl ClientShellState {
         let item_count = self
             .snapshot
             .as_deref()
-            .map(global_menu_items)
-            .map_or(0, |items| items.len());
+            .map(|snapshot| global_menu_items(snapshot, self.config.language).len())
+            .unwrap_or(0);
         let Some(ClientShellOverlay::GlobalMenu(menu)) = self.overlay.as_mut() else {
             return;
         };
@@ -82,8 +89,9 @@ impl ClientShellState {
         index: usize,
         outcome: &mut ClientShellInput,
     ) {
+        let language = self.config.language;
         let Some(action) = self.snapshot.as_deref().and_then(|snapshot| {
-            global_menu_items(snapshot)
+            global_menu_items(snapshot, language)
                 .get(index)
                 .map(|(_, action)| *action)
         }) else {
@@ -103,6 +111,7 @@ impl ClientShellState {
             ClientGlobalMenuAction::Binding(binding) => {
                 self.record_binding(crate::input::KeybindMatch::Action(binding), outcome)
             }
+            ClientGlobalMenuAction::Language => self.open_language_settings(outcome),
             ClientGlobalMenuAction::WhatsNew => self.open_release_notes(),
         }
         outcome.repaint = true;

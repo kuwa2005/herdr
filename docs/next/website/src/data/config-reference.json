@@ -1049,6 +1049,17 @@
           ]
         },
         {
+          "key": "ui.language",
+          "type": "enum",
+          "default": "\"en\"",
+          "description": "Language for Herdr menus, settings, and overlays. Switch from the global menu Language item or Settings.",
+          "values": [
+            "en",
+            "ja",
+            "zh-cn"
+          ]
+        },
+        {
           "key": "ui.sidebar.agents.row_gap",
           "type": "integer",
           "default": "0",

@@ -4,6 +4,7 @@ pub(crate) enum ConfigEdit<'a> {
     StatusIndicators(super::StatusIndicatorStyle),
     Sound(bool),
     ToastDelivery(super::ToastDelivery),
+    Language(super::UiLanguage),
 }
 
 impl ConfigEdit<'_> {
@@ -13,6 +14,7 @@ impl ConfigEdit<'_> {
             Self::StatusIndicators(_) => "status indicators",
             Self::Sound(_) => "sound setting",
             Self::ToastDelivery(_) => "toast setting",
+            Self::Language(_) => "language setting",
         }
     }
 
@@ -42,6 +44,12 @@ impl ConfigEdit<'_> {
                 let content = super::upsert_section_value(content, "ui.toast", "delivery", value);
                 super::remove_section_key(&content, "ui.toast", "enabled")
             }
+            Self::Language(language) => super::upsert_section_value(
+                content,
+                "ui",
+                "language",
+                &format!("\"{}\"", language.as_str()),
+            ),
         }
     }
 }
@@ -105,5 +113,14 @@ mod tests {
             toml::from_str::<toml::Value>(&written).is_ok(),
             "written config is not valid TOML: {written:?}"
         );
+    }
+
+    #[test]
+    fn language_edit_upserts_ui_language() {
+        let updated = ConfigEdit::Language(super::super::UiLanguage::Ja).apply("");
+        assert!(updated.contains("language = \"ja\""));
+        let zh = ConfigEdit::Language(super::super::UiLanguage::ZhCn).apply(&updated);
+        assert!(zh.contains("language = \"zh-cn\""));
+        assert!(!zh.contains("language = \"ja\""));
     }
 }

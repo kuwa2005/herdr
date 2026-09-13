@@ -1,6 +1,8 @@
 use super::*;
 
+#[path = "settings_overlay.rs"]
 mod settings_overlay;
+#[path = "worktree_overlays.rs"]
 mod worktree_overlays;
 
 #[derive(Default)]
@@ -36,6 +38,7 @@ pub(crate) fn render_client_overlay(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     k: &LiveKeybindConfig,
+    language: crate::config::UiLanguage,
     p: &Palette,
 ) -> Option<OverlayRender> {
     if !matches!(
@@ -63,9 +66,13 @@ pub(crate) fn render_client_overlay(
         ClientShellOverlay::Navigator(v) => {
             render_navigator_overlay(b, v, endpoints, active_endpoint_id, p)
         }
-        ClientShellOverlay::Settings(v) => {
-            settings_overlay::render_settings_overlay(b, v, s.integration_updates_available, p)
-        }
+        ClientShellOverlay::Settings(v) => settings_overlay::render_settings_overlay(
+            b,
+            v,
+            s.integration_updates_available,
+            language,
+            p,
+        ),
         ClientShellOverlay::WorktreeCreate(v) => {
             worktree_overlays::render_worktree_create_overlay(b, v, p)
         }
@@ -84,9 +91,10 @@ pub(crate) fn render_global_menu(
     launcher: Rect,
     menu: &ClientGlobalMenuOverlay,
     snapshot: &ClientShellSnapshot,
+    language: crate::config::UiLanguage,
     palette: &Palette,
 ) -> Option<Vec<(Rect, usize)>> {
-    let items = super::super::global_menu::global_menu_items(snapshot);
+    let items = super::super::global_menu::global_menu_items(snapshot, language);
     let screen = buffer.area;
     let width = items
         .iter()
@@ -161,9 +169,10 @@ pub(crate) fn render_global_menu(
 pub(crate) fn render_context_menu(
     buffer: &mut Buffer,
     menu: &ClientContextMenuOverlay,
+    language: crate::config::UiLanguage,
     palette: &Palette,
 ) -> Option<Vec<(Rect, usize)>> {
-    let items = menu.items();
+    let items = menu.items(language);
     let screen = buffer.area;
     let max_item_width = items
         .iter()

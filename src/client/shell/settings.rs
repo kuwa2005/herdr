@@ -26,6 +26,13 @@ fn toast_index(delivery: crate::config::ToastDelivery) -> usize {
     }
 }
 
+fn language_index(language: crate::config::UiLanguage) -> usize {
+    crate::config::UiLanguage::ALL
+        .iter()
+        .position(|candidate| *candidate == language)
+        .unwrap_or(0)
+}
+
 pub(super) fn integration_needs_install(info: &crate::api::schema::IntegrationInfo) -> bool {
     info.state == crate::api::schema::IntegrationState::Outdated
         || info.available && info.state == crate::api::schema::IntegrationState::NotInstalled
@@ -45,12 +52,27 @@ impl ClientShellState {
         }));
     }
 
+    pub(super) fn open_language_settings(&mut self, outcome: &mut ClientShellInput) {
+        self.overlay = Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+            section: ClientSettingsSection::Language,
+            selected: language_index(self.config.language),
+            original_theme_name: self.config.theme_name.clone(),
+            original_palette: self.config.palette.clone(),
+            integrations: Vec::new(),
+            integration_messages: Vec::new(),
+            loading_integrations: false,
+            installing_integrations: false,
+        }));
+        outcome.repaint = true;
+    }
+
     fn selected_index_for_settings_section(&self, section: ClientSettingsSection) -> usize {
         match section {
             ClientSettingsSection::Theme => theme_index(&self.config.theme_name),
             ClientSettingsSection::Indicators => indicator_index(self.config.status_indicators),
             ClientSettingsSection::Sound => usize::from(!self.config.sound_enabled),
             ClientSettingsSection::Toast => toast_index(self.config.toast_delivery),
+            ClientSettingsSection::Language => language_index(self.config.language),
             ClientSettingsSection::Integrations => 0,
         }
     }
@@ -99,6 +121,7 @@ impl ClientShellState {
                 ClientSettingsSection::Theme => crate::config::THEME_NAMES.len(),
                 ClientSettingsSection::Indicators | ClientSettingsSection::Sound => 2,
                 ClientSettingsSection::Toast => 4,
+                ClientSettingsSection::Language => crate::config::UiLanguage::ALL.len(),
                 ClientSettingsSection::Integrations => settings.integrations.len(),
             },
             _ => 0,
@@ -221,6 +244,12 @@ impl ClientShellState {
                     crate::config::ConfigEdit::ToastDelivery(delivery),
                     outcome,
                 );
+            }
+            ClientSettingsSection::Language => {
+                let Some(language) = crate::config::UiLanguage::ALL.get(selected).copied() else {
+                    return;
+                };
+                self.save_settings_edit(crate::config::ConfigEdit::Language(language), outcome);
             }
             ClientSettingsSection::Integrations => self.install_recommended_integrations(outcome),
         }

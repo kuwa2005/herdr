@@ -37,8 +37,10 @@ pub(super) fn render_settings_overlay(
     buffer: &mut Buffer,
     settings: &ClientSettingsOverlay,
     integration_updates_available: bool,
+    language: crate::config::UiLanguage,
     palette: &Palette,
 ) -> Option<OverlayRender> {
+    use crate::i18n::{t, Msg};
     let integration_height = 14u16
         .saturating_add(settings.integrations.len().max(1) as u16)
         .saturating_add(settings.integration_messages.len().min(6) as u16);
@@ -58,7 +60,7 @@ pub(super) fn render_settings_overlay(
         inner.x,
         inner.y,
         inner.width,
-        " settings",
+        t(language, Msg::SettingsTitle),
         Style::default()
             .fg(palette.text)
             .bg(palette.panel_bg)
@@ -75,9 +77,9 @@ pub(super) fn render_settings_overlay(
     for section in ClientSettingsSection::ALL {
         let badge = *section == ClientSettingsSection::Integrations && integration_badge;
         let label = if badge {
-            format!(" ● {} ", section.label())
+            format!(" ● {} ", section.label(language))
         } else {
-            format!(" {} ", section.label())
+            format!(" {} ", section.label(language))
         };
         let width = display_width(&label).min(inner.right().saturating_sub(tab_x));
         let rect = Rect::new(tab_x, inner.y + 1, width, 1);
@@ -162,9 +164,12 @@ pub(super) fn render_settings_overlay(
             render_choice_section(
                 buffer,
                 content,
-                "agent status indicators",
-                "choose color dots or distinct symbols for each state",
-                &["color dots  ● ● ● ○ ·", "distinct symbols  × ◐ ✓ ○ ·"],
+                t(language, Msg::SettingsIndicatorsTitle),
+                t(language, Msg::SettingsIndicatorsHelp),
+                &[
+                    t(language, Msg::SettingsIndicatorsDots),
+                    t(language, Msg::SettingsIndicatorsSymbols),
+                ],
                 settings.selected,
                 palette,
                 &mut choice_hits,
@@ -174,9 +179,12 @@ pub(super) fn render_settings_overlay(
             render_choice_section(
                 buffer,
                 content,
-                "sound alerts",
-                "play sounds when agents change state in background",
-                &["on", "off"],
+                t(language, Msg::SettingsSoundTitle),
+                t(language, Msg::SettingsSoundHelp),
+                &[
+                    t(language, Msg::SettingsSoundOn),
+                    t(language, Msg::SettingsSoundOff),
+                ],
                 settings.selected,
                 palette,
                 &mut choice_hits,
@@ -186,9 +194,30 @@ pub(super) fn render_settings_overlay(
             render_choice_section(
                 buffer,
                 content,
-                "notification popups",
-                "choose where background popup notifications should appear",
-                &["off", "inside herdr", "via terminal", "via system"],
+                t(language, Msg::SettingsToastTitle),
+                t(language, Msg::SettingsToastHelp),
+                &[
+                    t(language, Msg::SettingsToastOff),
+                    t(language, Msg::SettingsToastHerdr),
+                    t(language, Msg::SettingsToastTerminal),
+                    t(language, Msg::SettingsToastSystem),
+                ],
+                settings.selected,
+                palette,
+                &mut choice_hits,
+            );
+        }
+        ClientSettingsSection::Language => {
+            let choices: Vec<&'static str> = crate::config::UiLanguage::ALL
+                .iter()
+                .map(|lang| lang.native_label())
+                .collect();
+            render_choice_section(
+                buffer,
+                content,
+                t(language, Msg::SettingsLanguageTitle),
+                t(language, Msg::SettingsLanguageHelp),
+                &choices,
                 settings.selected,
                 palette,
                 &mut choice_hits,
@@ -212,9 +241,9 @@ pub(super) fn render_settings_overlay(
             buffer,
             primary,
             if settings.section == ClientSettingsSection::Integrations {
-                " ↵ install "
+                t(language, Msg::SettingsInstall)
             } else {
-                " ↵ apply "
+                t(language, Msg::SettingsApply)
             },
             Style::default()
                 .fg(contrast(palette))
@@ -228,7 +257,7 @@ pub(super) fn render_settings_overlay(
     button(
         buffer,
         close,
-        " esc close ",
+        t(language, Msg::SettingsClose),
         Style::default()
             .fg(palette.text)
             .bg(palette.surface0)
@@ -239,7 +268,7 @@ pub(super) fn render_settings_overlay(
         inner.x,
         inner.bottom().saturating_sub(2),
         inner.width,
-        " ↑↓ select  tab section",
+        t(language, Msg::SettingsHint),
         Style::default().fg(palette.overlay1).bg(palette.panel_bg),
     );
 

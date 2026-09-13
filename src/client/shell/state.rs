@@ -81,6 +81,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) agents: crate::config::AgentsSidebarConfig,
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
+    pub(super) language: crate::config::UiLanguage,
     pub(super) sound_enabled: bool,
     pub(super) toast_delivery: crate::config::ToastDelivery,
     pub(super) toast_delay_seconds: u64,
@@ -442,6 +443,7 @@ pub(super) enum ClientSettingsSection {
     Indicators,
     Sound,
     Toast,
+    Language,
     Integrations,
 }
 
@@ -451,16 +453,19 @@ impl ClientSettingsSection {
         Self::Indicators,
         Self::Sound,
         Self::Toast,
+        Self::Language,
         Self::Integrations,
     ];
 
-    pub(super) fn label(self) -> &'static str {
+    pub(super) fn label(self, language: crate::config::UiLanguage) -> &'static str {
+        use crate::i18n::{t, Msg};
         match self {
-            Self::Theme => "theme",
-            Self::Indicators => "indicators",
-            Self::Sound => "sound",
-            Self::Toast => "toasts",
-            Self::Integrations => "integrations",
+            Self::Theme => t(language, Msg::SettingsTabTheme),
+            Self::Indicators => t(language, Msg::SettingsTabIndicators),
+            Self::Sound => t(language, Msg::SettingsTabSound),
+            Self::Toast => t(language, Msg::SettingsTabToasts),
+            Self::Language => t(language, Msg::SettingsTabLanguage),
+            Self::Integrations => t(language, Msg::SettingsTabIntegrations),
         }
     }
 }

@@ -1,50 +1,61 @@
 use super::*;
+use crate::i18n::{t, Msg};
 
 impl ClientContextMenuOverlay {
-    pub(super) fn items(&self) -> Vec<ClientContextMenuItem> {
+    pub(super) fn items(&self, language: crate::config::UiLanguage) -> Vec<ClientContextMenuItem> {
         use ClientContextMenuAction as Action;
 
-        let item = |label, action| ClientContextMenuItem { label, action };
+        let item = |msg, action| ClientContextMenuItem {
+            label: t(language, msg),
+            action,
+        };
         match &self.target {
             ClientContextMenuTarget::Workspace { is_git: false, .. } => {
-                vec![item("Rename", Action::Rename), item("Close", Action::Close)]
+                vec![
+                    item(Msg::CtxRename, Action::Rename),
+                    item(Msg::CtxClose, Action::Close),
+                ]
             }
             ClientContextMenuTarget::Workspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
                 ..
             } => vec![
-                item("Rename", Action::Rename),
-                item("Close", Action::Close),
-                item("New worktree", Action::NewWorktree),
-                item("Open worktree...", Action::OpenWorktree),
+                item(Msg::CtxRename, Action::Rename),
+                item(Msg::CtxClose, Action::Close),
+                item(Msg::CtxNewWorktree, Action::NewWorktree),
+                item(Msg::CtxOpenWorktree, Action::OpenWorktree),
             ],
             ClientContextMenuTarget::Workspace {
                 is_linked_worktree: true,
                 ..
             } => vec![
-                item("Rename", Action::Rename),
-                item("Close", Action::Close),
-                item("Delete worktree checkout...", Action::RemoveWorktree),
+                item(Msg::CtxRename, Action::Rename),
+                item(Msg::CtxClose, Action::Close),
+                item(Msg::CtxRemoveWorktree, Action::RemoveWorktree),
             ],
             ClientContextMenuTarget::Workspace {
                 has_worktree_children: true,
                 collapsed,
                 ..
             } => vec![
-                item("Rename", Action::Rename),
-                item("Close group", Action::Close),
-                item("New worktree", Action::NewWorktree),
-                item("Open worktree...", Action::OpenWorktree),
+                item(Msg::CtxRename, Action::Rename),
+                item(Msg::CtxCloseGroup, Action::Close),
+                item(Msg::CtxNewWorktree, Action::NewWorktree),
+                item(Msg::CtxOpenWorktree, Action::OpenWorktree),
                 item(
-                    if *collapsed { "Expand" } else { "Collapse" },
+                    if *collapsed {
+                        Msg::CtxExpand
+                    } else {
+                        Msg::CtxCollapse
+                    },
                     Action::ToggleGroup,
                 ),
             ],
             ClientContextMenuTarget::Tab { .. } => vec![
-                item("New tab", Action::NewTab),
-                item("Rename", Action::Rename),
-                item("Close", Action::Close),
+                item(Msg::CtxNewTab, Action::NewTab),
+                item(Msg::CtxRename, Action::Rename),
+                item(Msg::CtxClose, Action::Close),
             ],
             ClientContextMenuTarget::Pane {
                 source_pane_id,
@@ -52,26 +63,26 @@ impl ClientContextMenuOverlay {
                 right_click_passthrough,
                 ..
             } => {
-                let mut items = vec![item("Rename pane", Action::RenamePane)];
+                let mut items = vec![item(Msg::CtxRenamePane, Action::RenamePane)];
                 if *has_manual_label {
-                    items.push(item("Clear pane name", Action::ClearPaneName));
+                    items.push(item(Msg::CtxClearPaneName, Action::ClearPaneName));
                 }
                 if source_pane_id.is_some() {
-                    items.push(item("Swap with focused pane", Action::SwapWithFocusedPane));
+                    items.push(item(Msg::CtxSwapWithFocused, Action::SwapWithFocusedPane));
                 }
                 items.extend([
-                    item("Split right", Action::SplitRight),
-                    item("Split down", Action::SplitDown),
-                    item("Zoom", Action::Zoom),
+                    item(Msg::CtxSplitRight, Action::SplitRight),
+                    item(Msg::CtxSplitDown, Action::SplitDown),
+                    item(Msg::CtxZoom, Action::Zoom),
                     item(
                         if *right_click_passthrough {
-                            "Use Herdr right-click menu"
+                            Msg::CtxUseHerdrRightClick
                         } else {
-                            "Send right-clicks to pane"
+                            Msg::CtxSendRightClicksToPane
                         },
                         Action::ToggleRightClickPassthrough,
                     ),
-                    item("Close pane", Action::ClosePane),
+                    item(Msg::CtxClosePane, Action::ClosePane),
                 ]);
                 items
             }
@@ -168,10 +179,11 @@ impl ClientShellState {
     }
 
     pub(super) fn move_context_menu_selection(&mut self, delta: isize) {
+        let language = self.config.language;
         let Some(ClientShellOverlay::ContextMenu(menu)) = self.overlay.as_mut() else {
             return;
         };
-        let item_count = menu.items().len();
+        let item_count = menu.items(language).len();
         if item_count == 0 {
             return;
         }
@@ -187,7 +199,11 @@ impl ClientShellState {
         let Some(ClientShellOverlay::ContextMenu(menu)) = self.overlay.take() else {
             return;
         };
-        let Some(action) = menu.items().get(index).map(|item| item.action) else {
+        let Some(action) = menu
+            .items(self.config.language)
+            .get(index)
+            .map(|item| item.action)
+        else {
             outcome.repaint = true;
             return;
         };
