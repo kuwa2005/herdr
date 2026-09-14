@@ -7,6 +7,8 @@ mod worktree_overlays;
 
 #[derive(Default)]
 pub(crate) struct OverlayRender {
+    pub(crate) area: Rect,
+    pub(crate) menu_rows: Vec<(Rect, usize)>,
     pub(crate) primary: Rect,
     pub(crate) clear: Rect,
     pub(crate) cancel: Rect,
@@ -93,7 +95,7 @@ pub(crate) fn render_global_menu(
     snapshot: &ClientShellSnapshot,
     language: crate::config::UiLanguage,
     palette: &Palette,
-) -> Option<Vec<(Rect, usize)>> {
+) -> Option<OverlayRender> {
     let items = super::super::global_menu::global_menu_items(snapshot, language);
     let screen = buffer.area;
     let width = items
@@ -116,12 +118,8 @@ pub(crate) fn render_global_menu(
         .saturating_sub(width)
         .min(screen.right().saturating_sub(width));
     let y = launcher.y.saturating_sub(height).max(screen.y);
-    let inner = panel(
-        buffer,
-        Rect::new(x, y, width, height),
-        palette.accent,
-        palette.panel_bg,
-    )?;
+    let rect = Rect::new(x, y, width, height);
+    let inner = panel(buffer, rect, palette.accent, palette.panel_bg)?;
     let mut rows = Vec::new();
     for (index, (label, action)) in items.iter().enumerate() {
         let row_y = inner.y.saturating_add(index as u16);
@@ -163,7 +161,11 @@ pub(crate) fn render_global_menu(
         }
         rows.push((row, index));
     }
-    Some(rows)
+    Some(OverlayRender {
+        area: rect,
+        menu_rows: rows,
+        ..OverlayRender::default()
+    })
 }
 
 pub(crate) fn render_context_menu(
@@ -171,7 +173,7 @@ pub(crate) fn render_context_menu(
     menu: &ClientContextMenuOverlay,
     language: crate::config::UiLanguage,
     palette: &Palette,
-) -> Option<Vec<(Rect, usize)>> {
+) -> Option<OverlayRender> {
     let items = menu.items(language);
     let screen = buffer.area;
     let max_item_width = items
@@ -216,7 +218,11 @@ pub(crate) fn render_context_menu(
         put_text(buffer, row.x, row.y, row.width, item.label, style);
         rows.push((row, index));
     }
-    Some(rows)
+    Some(OverlayRender {
+        area: rect,
+        menu_rows: rows,
+        ..OverlayRender::default()
+    })
 }
 
 fn panel(
@@ -315,7 +321,10 @@ fn render_release_notes_overlay(
     )?;
     let inner = panel(b, outer, p.accent, p.panel_bg)?;
     if inner.height < 8 || inner.width < 20 {
-        return Some(OverlayRender::default());
+        return Some(OverlayRender {
+            area: outer,
+            ..OverlayRender::default()
+        });
     }
 
     let stack = crate::ui::modal_stack_areas(inner, 2, 1, 0, 1);
@@ -406,6 +415,7 @@ fn render_release_notes_overlay(
     }
 
     Some(OverlayRender {
+        area: outer,
         primary: close,
         release_notes_scrollbar: track.unwrap_or_default(),
         release_notes_scroll_metrics: Some(metrics),
@@ -426,7 +436,10 @@ fn render_product_announcement_overlay(
     )?;
     let inner = panel(b, outer, p.accent, p.panel_bg)?;
     if inner.height < 8 || inner.width < 20 {
-        return Some(OverlayRender::default());
+        return Some(OverlayRender {
+            area: outer,
+            ..OverlayRender::default()
+        });
     }
 
     let stack = crate::ui::modal_stack_areas(inner, 2, 1, 0, 1);
@@ -518,6 +531,7 @@ fn render_product_announcement_overlay(
     }
 
     Some(OverlayRender {
+        area: outer,
         primary: close,
         product_announcement_scrollbar: track.unwrap_or_default(),
         product_announcement_scroll_metrics: Some(metrics),
@@ -530,7 +544,10 @@ fn render_onboarding_overlay(b: &mut Buffer, p: &Palette) -> Option<OverlayRende
     let outer = popup(b.area, 64, 16)?;
     let inner = panel(b, outer, p.accent, p.panel_bg)?;
     if inner.height < 11 {
-        return Some(OverlayRender::default());
+        return Some(OverlayRender {
+            area: outer,
+            ..OverlayRender::default()
+        });
     }
     let stack = crate::ui::modal_stack_areas(inner, 2, 0, 1, 1);
     let base = Style::default()
@@ -611,6 +628,7 @@ fn render_onboarding_overlay(b: &mut Buffer, p: &Palette) -> Option<OverlayRende
             .remove_modifier(Modifier::DIM),
     );
     Some(OverlayRender {
+        area: outer,
         primary,
         ..OverlayRender::default()
     })
@@ -664,6 +682,7 @@ fn render_rename_overlay(
     button(b, *clear, " ^c clear ", n);
     button(b, *cancel, " esc cancel ", n);
     Some(OverlayRender {
+        area: q,
         primary: *save,
         clear: *clear,
         cancel: *cancel,
@@ -921,6 +940,7 @@ fn render_navigator_overlay(
         Style::default().fg(p.overlay0).bg(p.panel_bg),
     );
     Some(OverlayRender {
+        area: q,
         primary: Rect::default(),
         clear: Rect::default(),
         cancel: Rect::default(),
@@ -1122,6 +1142,7 @@ fn render_help_overlay(
         Style::default().fg(p.overlay0).bg(p.panel_bg),
     );
     Some(OverlayRender {
+        area: q,
         cancel: close,
         help_popup: q,
         help_scrollbar: scrollbar.unwrap_or_default(),
@@ -1185,6 +1206,7 @@ fn render_confirm_close_overlay(
             .add_modifier(Modifier::BOLD),
     );
     Some(OverlayRender {
+        area: q,
         primary: *ok,
         clear: Rect::default(),
         cancel: *cancel,
