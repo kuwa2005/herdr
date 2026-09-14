@@ -257,7 +257,16 @@ impl RemoteExecutable {
     }
 
     fn bridge_command(&self, session_name: &str) -> String {
-        let args = Self::session_args(session_name, &["remote-client-bridge"]);
+        self.bridge_command_with_idle_timeout(session_name, false)
+    }
+
+    fn bridge_command_with_idle_timeout(&self, session_name: &str, idle_timeout: bool) -> String {
+        let command = if idle_timeout {
+            &["remote-client-bridge", "--idle-timeout-v1"][..]
+        } else {
+            &["remote-client-bridge"][..]
+        };
+        let args = Self::session_args(session_name, command);
         match self {
             Self::PosixShellPath(_) => {
                 posix_remote_output_command(&format!("exec {}", self.command(&args)))
@@ -309,6 +318,7 @@ pub(super) struct RemoteHerdr {
     install_suffix: String,
     executable: RemoteExecutable,
     platform: RemotePlatform,
+    bridge_idle_timeout: bool,
 }
 
 impl RemoteHerdr {
@@ -327,6 +337,7 @@ impl RemoteHerdr {
             install_suffix,
             executable,
             platform,
+            bridge_idle_timeout: false,
         }
     }
 
@@ -971,9 +982,12 @@ pub(super) fn find_installed_remote_herdr(ssh: &RemoteSsh) -> io::Result<RemoteH
             .map(|prepared| prepared.remote_herdr);
     }
     let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
-    for candidate in candidates {
-        if remote_binary_supports_endpoint_requirement(ssh, &candidate, true)? {
-            return Ok(candidate);
+    for mut candidate in candidates {
+        if let Some(status) = remote_client_status(ssh, &candidate)? {
+            if status.supports_endpoint_requirement(&candidate.platform, true) {
+                candidate.bridge_idle_timeout = status.remote_bridge_idle_timeout;
+                return Ok(candidate);
+            }
         }
     }
     Err(io::Error::new(
@@ -1277,8 +1291,11 @@ fn remote_binary_supports_endpoint_requirement(
     remote_herdr: &RemoteHerdr,
     require_surface_interest: bool,
 ) -> io::Result<bool> {
-    Ok(remote_client_status(ssh, remote_herdr)?
-        .is_some_and(|status| status.supports_endpoint_requirement(require_surface_interest)))
+    Ok(
+        remote_client_status(ssh, remote_herdr)?.is_some_and(|status| {
+            status.supports_endpoint_requirement(&remote_herdr.platform, require_surface_interest)
+        }),
+    )
 }
 
 fn remote_binary_exists(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
@@ -1645,12 +1662,21 @@ struct RemoteClientStatusJson {
     endpoint_protocol_generation: Option<u32>,
     #[serde(default)]
     endpoint_capabilities: Vec<String>,
+    #[serde(default)]
+    remote_host_bridge: bool,
+    #[serde(default)]
+    remote_bridge_idle_timeout: bool,
 }
 
 impl RemoteClientStatusJson {
-    fn supports_endpoint_requirement(&self, require_surface_interest: bool) -> bool {
+    fn supports_endpoint_requirement(
+        &self,
+        platform: &RemotePlatform,
+        require_surface_interest: bool,
+    ) -> bool {
         self.endpoint_protocol_generation
             == Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION)
+            && (!platform.is_windows() || self.remote_host_bridge)
             && (!require_surface_interest
                 || [
                     crate::protocol::endpoint::SURFACE_INTEREST_CAPABILITY,
@@ -2171,7 +2197,13 @@ impl SshStdioBridge {
     ) -> io::Result<Self> {
         Self::start_command(
             target,
-            remote_herdr.executable.bridge_command(&session_name),
+            if noninteractive && remote_herdr.bridge_idle_timeout {
+                remote_herdr
+                    .executable
+                    .bridge_command_with_idle_timeout(&session_name, true)
+            } else {
+                remote_herdr.executable.bridge_command(&session_name)
+            },
             local_socket,
             ssh_options,
             noninteractive,
@@ -3343,6 +3375,10 @@ mod tests {
 
     #[test]
     fn saved_machine_compatibility_uses_capabilities_not_release_or_private_protocol() {
+        let linux = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
         let mut status = RemoteClientStatusJson {
             version: Some("0.1.0".into()),
             protocol: Some(1),
@@ -3354,16 +3390,18 @@ mod tests {
                 crate::protocol::endpoint::PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
                 crate::protocol::endpoint::HEALTH_CHECK_CAPABILITY.into(),
             ],
+            remote_host_bridge: false,
+            remote_bridge_idle_timeout: false,
         };
-        assert!(status.supports_endpoint_requirement(true));
+        assert!(status.supports_endpoint_requirement(&linux, true));
         for index in 0..status.endpoint_capabilities.len() {
             let removed = status.endpoint_capabilities.remove(index);
-            assert!(!status.supports_endpoint_requirement(true));
-            assert!(status.supports_endpoint_requirement(false));
+            assert!(!status.supports_endpoint_requirement(&linux, true));
+            assert!(status.supports_endpoint_requirement(&linux, false));
             status.endpoint_capabilities.insert(index, removed);
         }
         status.endpoint_protocol_generation = None;
-        assert!(!status.supports_endpoint_requirement(true));
+        assert!(!status.supports_endpoint_requirement(&linux, true));
     }
 
     #[test]
@@ -3919,6 +3957,25 @@ mod tests {
     }
 
     #[test]
+    fn remote_bridge_idle_timeout_requires_explicit_support_and_opt_in() {
+        let legacy = parse_client_status_json(r#"{"endpoint_protocol_generation":1}"#).unwrap();
+        assert!(!legacy.remote_bridge_idle_timeout);
+        let current = parse_client_status_json(
+            r#"{"endpoint_protocol_generation":1,"remote_bridge_idle_timeout":true}"#,
+        )
+        .unwrap();
+        assert!(current.remote_bridge_idle_timeout);
+        let remote = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert!(remote
+            .executable
+            .bridge_command_with_idle_timeout("agents", true)
+            .ends_with(" --session agents remote-client-bridge --idle-timeout-v1"));
+    }
+
+    #[test]
     fn remote_bridge_command_uses_installed_binary() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
@@ -4142,6 +4199,10 @@ mod tests {
 
     #[test]
     fn saved_machine_setup_handoffs_old_server_missing_presentation_fence() {
+        let linux = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
         // Captured from Rohan after installing a new binary while the old daemon stayed alive.
         let installed = parse_client_status_json(
             r#"{"version":"0.8.2","protocol":22,"endpoint_protocol_generation":1,"endpoint_capabilities":["surface_interest","presentation_effects_fence","health_check"]}"#,
@@ -4151,8 +4212,8 @@ mod tests {
             r#"{"version":"0.8.2","protocol":22,"endpoint_protocol_generation":1,"endpoint_capabilities":["surface_interest","health_check"]}"#,
         )
         .unwrap();
-        assert!(installed.supports_endpoint_requirement(true));
-        assert!(!running_binary.supports_endpoint_requirement(true));
+        assert!(installed.supports_endpoint_requirement(&linux, true));
+        assert!(!running_binary.supports_endpoint_requirement(&linux, true));
         for (live_capabilities, expected) in [
             (
                 running_binary.endpoint_capabilities,
