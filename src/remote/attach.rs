@@ -30,8 +30,10 @@ const NONINTERACTIVE_SSH_STDERR_LIMIT: usize = 16 * 1024;
 const BRIDGE_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const REMOTE_OUTPUT_READY_MARKER: &str = "herdr-remote-output-ready:1";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";

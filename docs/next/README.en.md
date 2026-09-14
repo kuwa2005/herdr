@@ -42,7 +42,7 @@ This repository ([`kuwa2005/herdr`](https://github.com/kuwa2005/herdr)) is a **J
 
 ## install
 
-Installers are fetched from **this repository**. Release binaries still come from upstream public releases (this fork does not publish its own assets). `herdr update` follows the upstream update channel.
+Installers, release binaries, and the `herdr update` manifest all come from **this repository** ([`kuwa2005/herdr`](https://github.com/kuwa2005/herdr)) GitHub Releases / `distribution/*.json`.
 
 ### Linux / macOS
 
@@ -76,7 +76,7 @@ curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/kuwa2005/herdr/mas
 
 ### Other options
 
-`brew install herdr` · `mise use -g herdr` · [upstream binaries](https://github.com/herdrdev/herdr/releases)
+`brew install herdr` · `mise use -g herdr` · [binaries from this repo](https://github.com/kuwa2005/herdr/releases)
 
 then start it where the work lives:
 

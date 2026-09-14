@@ -42,7 +42,7 @@ https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 
 ## インストール
 
-インストーラは **このリポジトリ**（`kuwa2005/herdr`）から取得します。配布バイナリは upstream の公開リリースを参照します（fork 専用リリースを出していないため）。`herdr update` も upstream の更新チャネルに追従します。
+インストーラ・配布バイナリ・`herdr update` のマニフェストは、すべて **このリポジトリ**（[`kuwa2005/herdr`](https://github.com/kuwa2005/herdr)）の GitHub Releases / `distribution/*.json` を使います。
 
 ### Linux / macOS
 
@@ -86,7 +86,7 @@ curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/kuwa2005/herdr/mas
 | --- | --- |
 | Homebrew | `brew install herdr` |
 | mise | `mise use -g herdr` |
-| バイナリ直リンク | [upstream Releases](https://github.com/herdrdev/herdr/releases) |
+| バイナリ直リンク | [Releases（このリポジトリ）](https://github.com/kuwa2005/herdr/releases) |
 | ソースビルド | 下記「開発」 |
 
 作業ディレクトリで起動:

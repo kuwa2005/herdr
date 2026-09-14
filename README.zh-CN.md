@@ -41,7 +41,7 @@ https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 
 ## 安装
 
-安装脚本从**本仓库**获取；发布二进制仍来自 upstream 公开 Release（本 fork 暂不单独发版）。`herdr update` 跟随 upstream 更新通道。
+安装脚本、发布二进制与 `herdr update` 清单均来自**本仓库**（[`kuwa2005/herdr`](https://github.com/kuwa2005/herdr)）的 GitHub Releases / `distribution/*.json`。
 
 ### Linux / macOS
 
@@ -75,7 +75,7 @@ curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/kuwa2005/herdr/mas
 
 ### 其他方式
 
-`brew install herdr` · `mise use -g herdr` · [upstream 二进制](https://github.com/herdrdev/herdr/releases)
+`brew install herdr` · `mise use -g herdr` · [本仓库二进制](https://github.com/kuwa2005/herdr/releases)
 
 然后在工作所在的目录启动它：
 

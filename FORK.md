@@ -58,7 +58,9 @@ git fetch upstream
 git merge upstream/master   # または rebase。方針に合わせて選択
 ```
 
-衝突しやすい箇所の例: `README.md`、`.github/MAINTAINERS`、`.github/APPROVED_CONTRIBUTORS`、`distribution/install.cmd`、この `FORK.md`。
+衝突しやすい箇所の例: `README.md`、`.github/MAINTAINERS`、`.github/APPROVED_CONTRIBUTORS`、`distribution/install.*`、`distribution/latest.json` / `preview.json`、この `FORK.md`。
+
+リリースバイナリは [`kuwa2005/herdr` Releases](https://github.com/kuwa2005/herdr/releases) から配布する。upstream を取り込んだあとにバージョンを上げる場合は、このリポジトリ側でタグとアセットを用意し、`distribution/latest.json`（必要なら `preview.json`）の URL を更新する。
 
 ## エージェント向け
 
