@@ -60,7 +60,17 @@ git merge upstream/master   # または rebase。方針に合わせて選択
 
 衝突しやすい箇所の例: `README.md`、`.github/MAINTAINERS`、`.github/APPROVED_CONTRIBUTORS`、`distribution/install.*`、`distribution/latest.json` / `preview.json`、この `FORK.md`。
 
-リリースバイナリは [`kuwa2005/herdr` Releases](https://github.com/kuwa2005/herdr/releases) から配布する。upstream を取り込んだあとにバージョンを上げる場合は、このリポジトリ側でタグとアセットを用意し、`distribution/latest.json`（必要なら `preview.json`）の URL を更新する。
+リリースバイナリは [`kuwa2005/herdr` Releases](https://github.com/kuwa2005/herdr/releases) から配布する。全 OS（linux / macos / windows）のアセットはこのリポジトリの Releases を指す。
+
+### リリース手順（簡略）
+
+1. `Cargo.toml` の `version` を上げてコミットし、`master` に push する。
+2. どちらか一方:
+   - `git tag vX.Y.Z && git push origin vX.Y.Z`
+   - または GitHub Actions の **Fork Release** を `workflow_dispatch` で実行（`version=X.Y.Z`）
+3. ワークフロー `.github/workflows/fork-release.yml` が全プラットフォームをビルドし、Release にアップロードし、`distribution/latest.json` を更新して `master` へ push する。
+
+upstream の `release.yml` は `herdrdev/herdr` 専用のまま。この fork では使わない。
 
 ## エージェント向け
 
