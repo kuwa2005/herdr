@@ -139,6 +139,12 @@ fn client_owned_sidebar_dividers_resize_live() {
         waiting_text.contains(" spaces"),
         "local sidebar must keep spaces while resizing: {waiting_text}"
     );
+    let divider_x = state.hits.sidebar_divider.x as usize;
+    assert_eq!(
+        waiting_frame.cells[divider_x].symbol.as_str(),
+        "|",
+        "sidebar/pane separator must stay ASCII-narrow for CJK Ambiguous-wide hosts"
+    );
     assert!(!waiting_text.contains(" machines"));
     assert!(!waiting_text.contains("Select a connected machine"));
     assert!(!waiting_text.contains("LIVE"));

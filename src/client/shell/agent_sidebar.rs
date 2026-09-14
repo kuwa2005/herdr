@@ -97,12 +97,14 @@ pub(super) fn render_agent_panel_header(
     if area.height == 0 {
         return false;
     }
+    // ASCII '-' avoids Ambiguous-wide U+2500 ─ overflowing onto the next row
+    // on CJK terminals and clipping the " agents" label.
     put_text(
         buffer,
         area.x,
         area.y,
         area.width,
-        &"─".repeat(area.width as usize),
+        &"-".repeat(area.width as usize),
         Style::default().fg(config.palette.surface_dim),
     );
     if area.height < 2 {
@@ -375,11 +377,7 @@ pub(super) fn render_agent_row(
 }
 
 fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
-    for (offset, character) in text.chars().take(width as usize).enumerate() {
-        if let Some(cell) = buffer.cell_mut((x + offset as u16, y)) {
-            cell.set_char(character).set_style(style);
-        }
-    }
+    super::render::put_text(buffer, x, y, width, text, style);
 }
 
 fn display_width(text: &str) -> usize {

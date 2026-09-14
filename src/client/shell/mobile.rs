@@ -161,7 +161,7 @@ fn render_header_button(
             area.x,
             y,
             1,
-            "│",
+            "|",
             Style::default()
                 .fg(palette.surface_dim)
                 .bg(palette.surface0),
@@ -535,7 +535,7 @@ fn render_close_button(buffer: &mut Buffer, area: Rect, palette: &Palette) {
             area.x,
             y,
             1,
-            "│",
+            "|",
             Style::default()
                 .fg(palette.surface_dim)
                 .bg(palette.surface0),
@@ -1108,7 +1108,7 @@ fn render_left_scrollbar(
             track.x,
             y,
             1,
-            "│",
+            "|",
             Style::default()
                 .fg(palette.surface_dim)
                 .bg(palette.panel_bg),

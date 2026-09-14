@@ -22,7 +22,10 @@ pub(in crate::client::shell) fn render_sidebar_background(
     let separator_x = area.right().saturating_sub(1);
     for y in area.y..area.bottom() {
         if let Some(cell) = buffer.cell_mut((separator_x, y)) {
-            cell.set_symbol("│");
+            // ASCII '|' stays one cell even when the host treats U+2502 │ as
+            // East-Asian Ambiguous-wide (common on Japanese Windows terminals).
+            // A wide │ here overwrites the leftmost pane's first column.
+            cell.set_symbol("|");
             cell.set_style(Style::default().fg(palette.surface_dim));
         }
     }
