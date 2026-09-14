@@ -1378,10 +1378,8 @@ mod tests {
 
     #[test]
     fn localize_command_translates_root_about_to_japanese() {
-        let cmd = crate::i18n::cli::localize_command(
-            super::command_en(),
-            crate::config::UiLanguage::Ja,
-        );
+        let cmd =
+            crate::i18n::cli::localize_command(super::command_en(), crate::config::UiLanguage::Ja);
         assert_eq!(
             cmd.get_about().map(|s| s.to_string()).as_deref(),
             Some("AI コーディングエージェント向けターミナルワークスペースマネージャー")

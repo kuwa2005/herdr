@@ -76,7 +76,11 @@ pub fn print_root_help(
     let lang = cli_language();
     let t = |english: &'static str| translate(lang, english);
 
-    writeln!(out, "{}", t("herdr — terminal workspace manager for AI coding agents"))?;
+    writeln!(
+        out,
+        "{}",
+        t("herdr — terminal workspace manager for AI coding agents")
+    )?;
     writeln!(out)?;
     writeln!(out, "{}", t("Usage: herdr [options]"))?;
     writeln!(out, "       herdr --session <name> [options]")?;
@@ -214,11 +218,7 @@ pub fn print_root_help(
         "  --skill             {}",
         t("Print the agent skill file and exit")
     )?;
-    writeln!(
-        out,
-        "  --version, -V       {}",
-        t("Print version and exit")
-    )?;
+    writeln!(out, "  --version, -V       {}", t("Print version and exit"))?;
     writeln!(out, "  --help, -h          {}", t("Show this help"))?;
     writeln!(out)?;
     writeln!(out, "{} {}", t("Config:"), config_path.display())?;
@@ -245,27 +245,6 @@ pub fn print_root_help(
         ))
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn japanese_translates_root_about() {
-        assert_eq!(
-            translate(UiLanguage::Ja, "terminal workspace manager for AI coding agents"),
-            "AI コーディングエージェント向けターミナルワークスペースマネージャー"
-        );
-    }
-
-    #[test]
-    fn missing_key_falls_back_to_english() {
-        assert_eq!(
-            translate(UiLanguage::Ja, "definitely not a catalog key"),
-            "definitely not a catalog key"
-        );
-    }
 }
 
 fn ja(english: &str) -> Option<&'static str> {
@@ -630,4 +609,28 @@ fn zh_cn(english: &str) -> Option<&'static str> {
         "terminal workspace manager for AI coding agents" => "面向 AI 编程智能体的终端工作区管理器",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn japanese_translates_root_about() {
+        assert_eq!(
+            translate(
+                UiLanguage::Ja,
+                "terminal workspace manager for AI coding agents"
+            ),
+            "AI コーディングエージェント向けターミナルワークスペースマネージャー"
+        );
+    }
+
+    #[test]
+    fn missing_key_falls_back_to_english() {
+        assert_eq!(
+            translate(UiLanguage::Ja, "definitely not a catalog key"),
+            "definitely not a catalog key"
+        );
+    }
 }
