@@ -308,7 +308,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin master
           git add distribution/latest.json
           git commit -m "release: point latest.json at v${VERSION} multi-os assets"
+          git pull --rebase origin master
           git push origin HEAD:master
