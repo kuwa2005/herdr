@@ -1,5 +1,8 @@
 # Contributing to Herdr
 
+> **kuwa2005/herdr:** このファイルは upstream（`herdrdev/herdr`）の貢献ポリシーです。  
+> このフォークの内部運用・所有者向け手順は [`FORK.md`](./FORK.md) を読んでください。upstream への実装 PR は予定していません。
+
 ## Herdr does not accept unsolicited pull requests
 
 We tried opening the pull request gate. It did not work.

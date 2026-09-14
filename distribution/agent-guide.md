@@ -28,21 +28,21 @@ Full concepts page: https://herdr.dev/docs/concepts/
 Linux and macOS:
 
 ```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.sh | sh
 herdr
 ```
 
 Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.ps1 | iex"
 herdr
 ```
 
 If endpoint security blocks that fileless PowerShell command, use Command Prompt:
 
 ```cmd
-curl.exe -fsSLo install.cmd https://herdr.dev/install.cmd && install.cmd && del install.cmd
+curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.cmd && install.cmd && del install.cmd
 herdr
 ```
 

@@ -1,85 +1,147 @@
 # herdr
 
-
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />
 </p>
 
 <p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
+  <a href="https://github.com/kuwa2005/herdr">このリポジトリ</a>
+  · <a href="#インストール">インストール</a>
+  · <a href="https://herdr.dev/ja/docs/quick-start/">クイックスタート</a>
+  · <a href="https://herdr.dev/ja/docs/">ドキュメント</a>
 </p>
 
 <p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
+  日本語 · <a href="README.en.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
+  <a href="https://github.com/kuwa2005/herdr"><img src="https://img.shields.io/badge/fork-kuwa2005%2Fherdr-666666?labelColor=333333&logo=github" alt="kuwa2005/herdr" /></a>
+  <a href="https://github.com/herdrdev/herdr"><img src="https://img.shields.io/badge/upstream-herdrdev%2Fherdr-666666?labelColor=333333&logo=github" alt="upstream herdrdev/herdr" /></a>
 </p>
 
 ---
 
 https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 
-**the runtime your coding agents live on.**
+**コーディングエージェントが住むランタイム。**
 
-- **detach without stopping work** — herdr keeps terminals running in a background server when you close the client or lose your SSH connection. after a server or machine restart, herdr restores the saved layout and can resume supported agent sessions; the original processes do not survive. [session state →](https://herdr.dev/docs/session-state/)
-- **several machines, one window** — keep local work and saved ssh machines together, with a combined agent list and independent reconnects. [remote machines →](https://herdr.dev/docs/connecting-machines/)
-- **never hunt for the stuck one** — every pane is marked working, blocked, or idle. when an agent stops and needs an answer, herdr says so.
-- **agent-native** — agents drive herdr through the cli and socket api: they can spawn panes, prompt each other, and wait until another agent is genuinely blocked. [agent skill →](https://herdr.dev/docs/agent-skill/)
-- **runs what you already run** — claude code, codex, cursor, opencode, grok and the rest. herdr doesn't wrap or replace them; it owns their terminals.
-- **keyboard and mouse, both first-class** — tmux-style prefix keys *and* click, drag, split. pick per moment, not per tool.
-- **plugins** — extend panes and workflows. [browse the marketplace →](https://herdr.dev/plugins/)
-- **one rust binary, no electron** — runs in whatever terminal you already use.
+このリポジトリ（[`kuwa2005/herdr`](https://github.com/kuwa2005/herdr)）は [herdrdev/herdr](https://github.com/herdrdev/herdr) の **日本語寄りフォーク**です。UI 言語（`en` / `ja` / `zh-cn`）やローカル向け修正を載せています。upstream の有用な更新は必要に応じて取り込みます。内部運用は [`FORK.md`](./FORK.md) を参照してください。
+
+- **閉じても作業は止まらない** — クライアントを閉じたり SSH が切れても、バックグラウンドサーバー上でターミナルが動き続けます。サーバーやマシン再起動後は保存済みレイアウトを復元し、対応エージェントは再開できます（元プロセスは残りません）。[セッション状態 →](https://herdr.dev/ja/docs/session-state/)
+- **複数マシンを一つの窓で** — ローカルと保存済み SSH を並べ、エージェント一覧をまとめ、接続ごとに独立して再接続できます。[リモートマシン →](https://herdr.dev/ja/docs/connecting-machines/)
+- **止まっているエージェントを探し回らない** — 各ペインは working / blocked / idle。回答待ちになると Herdr が知らせます。
+- **エージェントネイティブ** — CLI と socket API でペイン作成・相互プロンプト・本当に blocked になるまでの待機ができます。[エージェントスキル →](https://herdr.dev/ja/docs/agent-skill/)
+- **いま使っているものをそのまま** — Claude Code、Codex、Cursor、OpenCode、Grok など。ラップせず、ターミナルを所有します。
+- **キーボードもマウスも一等** — tmux 風プレフィックスと、クリック・ドラッグ・分割の両方。
+- **プラグイン** — ペインとワークフローを拡張。[マーケットプレイス →](https://herdr.dev/plugins/)
+- **Rust 単体バイナリ、Electron なし** — いつも使っている端末で動きます。
 
 ---
 
-## install
+## インストール
+
+インストーラは **このリポジトリ**（`kuwa2005/herdr`）から取得します。配布バイナリは upstream の公開リリースを参照します（fork 専用リリースを出していないため）。`herdr update` も upstream の更新チャネルに追従します。
+
+### Linux / macOS
 
 ```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.sh | sh
 ```
 
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [endpoint-protected Windows](https://herdr.dev/docs/windows-beta/) · [binaries](https://github.com/herdrdev/herdr/releases)
+### Windows（PowerShell）
 
-then start it where the work lives:
+PowerShell を開き、次を実行します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.ps1 | iex"
+```
+
+インストール後:
+
+1. **新しい PowerShell ウィンドウ**を開く（PATH 反映のため）
+2. `herdr` と入力して起動を確認する
+
+チャネルを明示する／引数を付けたい場合は、いったん保存してから実行します。
+
+```powershell
+irm https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Channel stable
+# プレビューの場合: -Channel preview
+Remove-Item .\install.ps1
+```
+
+### Windows（エンドポイント保護で PowerShell がブロックされる場合）
+
+**コマンドプロンプト（cmd）** で次を実行します。
+
+```cmd
+curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.cmd && install.cmd && del install.cmd
+```
+
+### その他の入手方法
+
+| 方法 | コマンド / リンク |
+| --- | --- |
+| Homebrew | `brew install herdr` |
+| mise | `mise use -g herdr` |
+| バイナリ直リンク | [upstream Releases](https://github.com/herdrdev/herdr/releases) |
+| ソースビルド | 下記「開発」 |
+
+作業ディレクトリで起動:
 
 ```bash
 herdr
 ```
 
-run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
+エージェントを走らせ、ペインを分割し、離れても大丈夫です。`ctrl+b q` でデタッチ、`herdr` で再アタッチ。[クイックスタート →](https://herdr.dev/ja/docs/quick-start/)
 
-## docs
+UI を日本語にする例（`~/.config/herdr/config.toml`）:
 
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [connecting machines](https://herdr.dev/docs/connecting-machines/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
+```toml
+[ui]
+language = "ja" # en | ja | zh-cn
+```
 
-## thanks
+グローバルメニューの **language**、または設定の **language** タブからも切り替えられます。
 
-every past sponsor and backer is listed in [SPONSORS.md](./SPONSORS.md) — thank you 🐑
+## ドキュメント
 
-enterprise / partnership: hey@herdr.dev
+公開ドキュメントは [herdr.dev/ja/docs](https://herdr.dev/ja/docs/) を参照してください。  
+[クイックスタート](https://herdr.dev/ja/docs/quick-start/) · [概念](https://herdr.dev/ja/docs/concepts/) · [対応エージェント](https://herdr.dev/ja/docs/agents/) · [キーボード](https://herdr.dev/ja/docs/keyboard/) · [設定](https://herdr.dev/ja/docs/configuration/) · [セッション状態](https://herdr.dev/ja/docs/session-state/) · [マシン接続](https://herdr.dev/ja/docs/connecting-machines/) · [リモート](https://herdr.dev/ja/docs/persistence-remote/) · [連携](https://herdr.dev/ja/docs/integrations/) · [プラグイン](https://herdr.dev/ja/docs/plugins/) · [Socket API](https://herdr.dev/ja/docs/socket-api/)
 
-## agent instructions
+## upstream について
 
-if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS.md) before making changes and read [`CONTRIBUTING.md`](./CONTRIBUTING.md) before opening issues or PRs.
+- 製品本体・公式ドキュメント・リリースバイナリの本家は [herdrdev/herdr](https://github.com/herdrdev/herdr) / [herdr.dev](https://herdr.dev) です。
+- この fork では日本語 UI やローカル向け修正を優先します。upstream の有用な更新は、必要に応じて取り込みます。
+- 本家への実装 PR は、Herdr の貢献ポリシー（承認コントリビュータのみ）に従ってください。
 
-## development
+スポンサー一覧は [SPONSORS.md](./SPONSORS.md)（upstream 由来）。企業・提携: hey@herdr.dev
+
+## エージェント向け
+
+このリポジトリを触る AI エージェントは、変更前に [`AGENTS.md`](./AGENTS.md) を、Issue / PR 前に [`CONTRIBUTING.md`](./CONTRIBUTING.md) を読んでください。
+
+## 開発
 
 ```bash
-git clone https://github.com/herdrdev/herdr
+git clone https://github.com/kuwa2005/herdr
 cd herdr
 cargo build --release
 
-just test        # unit tests
-just check       # formatting, tests, and maintenance checks
+just test        # ユニットテスト
+just check       # フォーマット・テスト・メンテ用チェック
 ```
 
-## license
+upstream を取り込む例:
 
-Herdr is licensed under the [Apache License 2.0](LICENSE).
+```bash
+git remote add upstream https://github.com/herdrdev/herdr.git   # 初回のみ
+git fetch upstream
+git merge upstream/master   # または rebase。方針に合わせて選択
+```
+
+## ライセンス
+
+Herdr は [Apache License 2.0](LICENSE) です。
