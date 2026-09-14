@@ -406,6 +406,24 @@ fn muse_manifest_requires_complete_live_controls() {
 }
 
 #[test]
+fn oimo_manifest_matches_opencode_style_controls() {
+    let permission = explain(
+        Agent::Oimo,
+        "Permission required\n\nesc dismiss · enter confirm · ↑↓ select",
+    );
+    assert_eq!(permission.state, AgentState::Blocked);
+    assert!(permission.visible_blocker);
+
+    let working = explain(Agent::Oimo, "Thinking...\n\nesc interrupt\n\n■■■■■■");
+    assert_eq!(working.state, AgentState::Working);
+    assert!(working.visible_working);
+
+    let working_ja = explain(Agent::Oimo, "作業中...\n\nesc 中断\n\n■■■■■■");
+    assert_eq!(working_ja.state, AgentState::Working);
+    assert!(working_ja.visible_working);
+}
+
+#[test]
 fn manifest_validation_rejects_unknown_fields_empty_rules_invalid_regions_and_regexes() {
     assert!(parse_manifest(
         r#"

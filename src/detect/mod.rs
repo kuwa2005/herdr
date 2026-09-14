@@ -64,10 +64,11 @@ pub enum Agent {
     Qwen,
     Maki,
     Muse,
+    Oimo,
 }
 
 impl Agent {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -91,9 +92,10 @@ impl Agent {
         Self::Qwen,
         Self::Maki,
         Self::Muse,
+        Self::Oimo,
     ];
 
-    pub const SCREEN_MANIFEST_AGENTS: [Self; 21] = [
+    pub const SCREEN_MANIFEST_AGENTS: [Self; 22] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -115,6 +117,7 @@ impl Agent {
         Self::Qwen,
         Self::Maki,
         Self::Muse,
+        Self::Oimo,
     ];
 }
 
@@ -143,6 +146,7 @@ pub fn agent_label(agent: Agent) -> &'static str {
         Agent::Qwen => "qwen",
         Agent::Maki => "maki",
         Agent::Muse => "muse",
+        Agent::Oimo => "oimo",
     }
 }
 
@@ -177,6 +181,7 @@ pub fn interactive_agent_executable(agent: Agent) -> &'static str {
         Agent::Qwen => "qwen",
         Agent::Maki => "maki",
         Agent::Muse => "muse",
+        Agent::Oimo => "oimo",
     }
 }
 
@@ -216,6 +221,7 @@ fn lookup_agent(name: &str) -> Option<Agent> {
         "qwen" | "qwen-code" | "qwen code" => Some(Agent::Qwen),
         "maki" => Some(Agent::Maki),
         "muse" | "muse-code" | "muse-cli" => Some(Agent::Muse),
+        "oimo" => Some(Agent::Oimo),
         _ if is_muse_versioned_binary(name) => Some(Agent::Muse),
         _ => None,
     }
@@ -827,6 +833,8 @@ mod tests {
             identify_agent(r"C:\Users\user\muse-bin-0.2.1-R1215.1.exe"),
             Some(Agent::Muse)
         );
+        assert_eq!(identify_agent("oimo"), Some(Agent::Oimo));
+        assert_eq!(identify_agent("oimo.exe"), Some(Agent::Oimo));
     }
 
     #[test]
@@ -854,6 +862,8 @@ mod tests {
         assert_eq!(parse_agent_label("qwen-code"), Some(Agent::Qwen));
         assert_eq!(parse_agent_label("maki"), Some(Agent::Maki));
         assert_eq!(parse_agent_label("kilo-code"), Some(Agent::Kilo));
+        assert_eq!(parse_agent_label("oimo"), Some(Agent::Oimo));
+        assert_eq!(parse_agent_label("oimo.exe"), Some(Agent::Oimo));
     }
 
     #[test]
@@ -898,6 +908,7 @@ mod tests {
             (Agent::Qwen, "qwen"),
             (Agent::Maki, "maki"),
             (Agent::Muse, "muse"),
+            (Agent::Oimo, "oimo"),
         ];
         assert_eq!(expected.len(), Agent::ALL.len());
         for (agent, executable) in expected {

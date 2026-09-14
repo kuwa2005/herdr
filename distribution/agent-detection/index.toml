@@ -65,6 +65,10 @@ id = "muse"
 path = "muse.toml"
 
 [[agents]]
+id = "oimo"
+path = "oimo.toml"
+
+[[agents]]
 id = "opencode"
 path = "opencode.toml"
 
