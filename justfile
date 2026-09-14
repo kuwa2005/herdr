@@ -228,3 +228,7 @@ release version:
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config
+
+# Summarize what each Herdr tab/pane is currently doing
+tabs-summary *args:
+    {{python}} scripts/summarize_herdr_tabs.py {{args}}

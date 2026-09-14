@@ -106,6 +106,27 @@ language = "ja" # en | ja | zh-cn
 
 グローバルメニューの **language**、または設定の **language** タブからも切り替えられます。
 
+## 付属ツール
+
+### タブ／ペイン要約（`summarize_herdr_tabs`）
+
+Herdr 上のタブとペインが **いま何をしているか** を、エージェント検出や直近の出力から要約します。
+
+```bash
+just tabs-summary
+# または
+python3 scripts/summarize_herdr_tabs.py
+```
+
+主なオプション（`python3 scripts/summarize_herdr_tabs.py --help`）:
+
+| オプション | 説明 |
+| --- | --- |
+| `--format plain` / `markdown` / `json` | 出力形式（既定: plain） |
+| `--workspace ID` | 対象ワークスペースを限定（繰り返し可） |
+| `--lines N` | トランスクリプトが無いときの直近行数（既定: 120） |
+| `--include-shell` | エージェント未検出のペインも含める |
+
 ## ドキュメント
 
 公開ドキュメントは [herdr.dev/ja/docs](https://herdr.dev/ja/docs/) を参照してください。  
