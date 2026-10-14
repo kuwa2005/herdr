@@ -3,12 +3,20 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from scripts.summarize_herdr_tabs import (
     PaneSummary,
     WorkspaceSummary,
+    automation_target_for_agent,
+    automation_targets_from_agent_list_payload,
     compose_summary,
+    herdr_json,
+    load_automation_targets_by_pane,
     render_plain,
     screen_current_activity,
     screen_latest_user_query,
@@ -77,6 +85,127 @@ class SummarizeHerdrTabsTests(unittest.TestCase):
         self.assertNotIn("Issue 化はしていません", query)
         self.assertIn("Finished", screen_current_activity(screen) or "")
 
+    def test_automation_target_prefers_agent_name(self) -> None:
+        self.assertEqual(
+            automation_target_for_agent(
+                {
+                    "name": "reviewer",
+                    "pane_id": "w1:p9",
+                    "terminal_id": "t1",
+                }
+            ),
+            "reviewer",
+        )
+        self.assertEqual(
+            automation_target_for_agent({"pane_id": "w1:p9", "terminal_id": "t1"}),
+            "w1:p9",
+        )
+        self.assertEqual(
+            automation_target_for_agent({"terminal_id": "t-only"}),
+            "t-only",
+        )
+
+    def test_load_automation_targets_by_pane_indexes_agents(self) -> None:
+        class FakeSummarize:
+            payloads: dict[tuple[str, ...], dict] = {
+                ("agent", "list"): {
+                    "result": {
+                        "agents": [
+                            {"name": "coder", "pane_id": "w1:p1"},
+                            {"pane_id": "w1:p2", "terminal_id": "t2"},
+                        ]
+                    }
+                }
+            }
+
+        def fake_herdr_json(herdr: str, args: list[str]) -> dict:
+            self.assertEqual(herdr, "herdr-test")
+            key = tuple(args)
+            return FakeSummarize.payloads[key]
+
+        import scripts.summarize_herdr_tabs as mod
+
+        original = mod.herdr_json
+        mod.herdr_json = fake_herdr_json
+        try:
+            targets = load_automation_targets_by_pane("herdr-test")
+        finally:
+            mod.herdr_json = original
+
+        self.assertEqual(
+            targets,
+            {"w1:p1": "coder", "w1:p2": "w1:p2"},
+        )
+
+    def _load_agent_list_v092_fixture(self) -> dict:
+        fixture = (
+            Path(__file__).resolve().parent / "fixtures" / "agent-list-v092.json"
+        )
+        return json.loads(fixture.read_text(encoding="utf-8"))
+
+    def test_automation_targets_from_v092_agent_list_fixture(self) -> None:
+        targets = automation_targets_from_agent_list_payload(
+            self._load_agent_list_v092_fixture()
+        )
+        self.assertEqual(
+            targets,
+            {"w2:p1": "coder", "w2:p2": "reviewer"},
+        )
+
+    def test_load_automation_targets_by_pane_uses_agent_list_fixture(self) -> None:
+        fixture_payload = self._load_agent_list_v092_fixture()
+
+        def fake_herdr_json(herdr: str, args: list[str]) -> dict:
+            self.assertEqual(herdr, "herdr-test")
+            self.assertEqual(args, ["agent", "list"])
+            return fixture_payload
+
+        import scripts.summarize_herdr_tabs as mod
+
+        original = mod.herdr_json
+        mod.herdr_json = fake_herdr_json
+        try:
+            targets = load_automation_targets_by_pane("herdr-test")
+        finally:
+            mod.herdr_json = original
+
+        self.assertEqual(
+            targets,
+            {"w2:p1": "coder", "w2:p2": "reviewer"},
+        )
+
+    def test_automation_targets_top_level_agents_fallback(self) -> None:
+        payload = {
+            "agents": [
+                {"name": "alpha", "pane_id": "w9:p1"},
+            ]
+        }
+        self.assertEqual(
+            automation_targets_from_agent_list_payload(payload),
+            {"w9:p1": "alpha"},
+        )
+
+    def test_herdr_json_raises_on_error_payload(self) -> None:
+        def fake_run(command: list[str]) -> subprocess.CompletedProcess[bytes]:
+            body = json.dumps({"error": {"code": "foo", "message": "bar"}})
+            return subprocess.CompletedProcess(command, 0, body.encode(), b"")
+
+        with patch("scripts.summarize_herdr_tabs.run_command", fake_run):
+            with self.assertRaises(RuntimeError) as ctx:
+                herdr_json("herdr", ["workspace", "list"])
+        msg = str(ctx.exception)
+        self.assertIn("foo", msg)
+        self.assertIn("bar", msg)
+
+        def fake_run_scalar(command: list[str]) -> subprocess.CompletedProcess[bytes]:
+            body = json.dumps({"error": "plain failure"})
+            return subprocess.CompletedProcess(command, 0, body.encode(), b"")
+
+        with patch("scripts.summarize_herdr_tabs.run_command", fake_run_scalar):
+            with self.assertRaises(RuntimeError) as ctx:
+                herdr_json("herdr", ["tab", "list"])
+        self.assertIn("plain failure", str(ctx.exception))
+
     def test_compose_summary_joins_parts(self) -> None:
         text = compose_summary(
             title="t",
@@ -97,6 +226,7 @@ class SummarizeHerdrTabsTests(unittest.TestCase):
                     tab_number=1,
                     tab_label="1",
                     pane_id="wB:p1",
+                    automation_target="reviewer",
                     title="Demo",
                     agent="cursor",
                     agent_status="working",
@@ -111,8 +241,9 @@ class SummarizeHerdrTabsTests(unittest.TestCase):
             ],
         )
         text = render_plain([ws])
-        self.assertIn("----------------", text)
+        self.assertIn("#" * 32, text)
         self.assertIn("tab 1: 1  <-- focused", text)
+        self.assertIn("target: reviewer", text)
         self.assertIn("依頼:", text)
         self.assertIn("いま:", text)
         self.assertNotIn("|------|", text)

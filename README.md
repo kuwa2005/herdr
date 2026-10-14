@@ -110,12 +110,18 @@ language = "ja" # en | ja | zh-cn
 
 ### タブ／ペイン要約（`summarize_herdr_tabs`）
 
-Herdr 上のタブとペインが **いま何をしているか** を、エージェント検出や直近の出力から要約します。
+Herdr 上のタブとペインが **いま何をしているか** を、エージェント検出や直近の出力から要約します。マルチエージェント自動化向けに、各行へ **automation target**（`herdr agent wait|prompt|read <TARGET>` に渡すハンドル）も含めます。
+
+- 値は `herdr agent list` から取得します（優先: リネームした `name` → `pane_id` → `terminal_id`）。
+- `pane.agent`（検出種別。例: `cursor`）とは別物です。
+- `agent list` が失敗しても要約本体は続行し、stderr に警告を出します（target 列は欠けることがあります）。
+- plain は `target:` 行、markdown は `target` 列（可能なとき `` `name` (`pane_id`) ``）、JSON は `automation_target` フィールドです。
 
 ```bash
 just tabs-summary
 # または
 python3 scripts/summarize_herdr_tabs.py
+python3 scripts/summarize_herdr_tabs.py --format markdown
 ```
 
 主なオプション（`python3 scripts/summarize_herdr_tabs.py --help`）:
@@ -127,6 +133,18 @@ python3 scripts/summarize_herdr_tabs.py
 | `--lines N` | トランスクリプトが無いときの直近行数（既定: 120） |
 | `--include-shell` | エージェント未検出のペインも含める |
 
+ユニットテスト: `python3 -m unittest scripts.test_summarize_herdr_tabs`（`just maintenance-test` にも登録）。
+
+### ターン制エージェント改善（`herdr_agent_turns`）
+
+coder / reviewer の **実装 → レビュー → 適用** を N ターン回し、最後に `SUMMARY.md` を書きます（この fork の公式ワークフロー）。
+
+```bash
+just agent-turns --coder coder --reviewer reviewer --turns 3 \
+  --goal "..." --notes-dir /var/tmp/herdr-turns-notes --workdir "$PWD"
+```
+
+詳細は [`FORK.md`](./FORK.md#マルチエージェント自動化) を参照してください。
 ## ドキュメント
 
 公開ドキュメントは [herdr.dev/ja/docs](https://herdr.dev/ja/docs/) を参照してください。  

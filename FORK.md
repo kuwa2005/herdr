@@ -78,3 +78,54 @@ upstream の `release.yml` は `herdrdev/herdr` 専用のまま。この fork �
 2. 認証アカウントが `kuwa2005` で、リモートが `kuwa2005/herdr` なら、**この fork 上の**実装・コミット・push は所有者作業として進めてよい。
 3. `herdrdev/herdr` への実装 PR・機能 Issue は開かない（CONTRIBUTING / AGENTS の外部貢献ガードを維持）。
 4. upstream 由来の再現バグを本家に報告する場合だけ、人間が CONTRIBUTING のバグテンプレート手順に従う。
+
+## マルチエージェント自動化
+
+Herdr 自体に「A の出力を B へ自動パイプする」機能はない。代わりに **ターン制ループ**（実装 → レビュー → 適用）を公式ワークフローとして使う。全ターン終了後に `SUMMARY.md` を出す。
+
+### `herdr_agent_turns`（公式）
+
+あらかじめ `coder` / `reviewer` を起動してから:
+
+```bash
+herdr agent start coder --kind cursor --pane <pane> -- --trust -f --model composer-2.5
+herdr agent start reviewer --kind cursor --pane <pane> -- --trust -f --model composer-2.5
+
+just agent-turns \
+  --coder coder \
+  --reviewer reviewer \
+  --turns 3 \
+  --goal "Improve multi-agent orchestration helpers" \
+  --notes-dir /var/tmp/herdr-turns-notes \
+  --workdir "$PWD"
+# または: python3 scripts/herdr_agent_turns.py ...
+```
+
+各ターンで `TURN{n}_RESULT.md` / `TURN{n}_REVIEW.md` を書き、最後に `SUMMARY.md`（ターンごとの実装・レビュー指示・適用結果）を出力する。`--dry-run` でプロンプト計画だけ確認できる。
+
+手動で同等のことをする場合:
+
+```bash
+herdr agent prompt coder "..."   # 必要なら focus / esc のあと
+herdr agent focus coder
+herdr agent prompt reviewer "..."
+herdr agent prompt coder "Apply REVIEW.md ..."
+```
+
+補足:
+
+- 対象名は `herdr agent rename` / `agent start <name>` の名前。一覧は `python3 scripts/summarize_herdr_tabs.py` の **target** 列でも確認できる。
+- `agent prompt --wait` が `agent_prompt_stalled` になるときは、UI を `esc` で戻すか、`--wait` なしで送ってから状態ポーリングする（`herdr_agent_turns` は後者）。
+- 既定セッションを汚さない再現・実験は名前付きセッション（`herdr --session ...`）を使う。
+
+### 自己改善ループ（記録: 3 ターン）
+
+Cursor Agent（`composer-2.5`）の coder / reviewer で、この fork の要約スクリプトを 3 ターン改善した。
+
+| ターン | 実装 | レビュー指摘 | 適用 |
+| --- | --- | --- | --- |
+| 1 | `automation_target` を plain / markdown / JSON に追加。`herdr_json` が `error` 付き JSON を失敗扱い | (1) agent list 失敗時は空 dict+警告 (2) docstring で target と `pane.agent` を区別 (3) 0.9.2 fixture テスト (4) markdown の pane 特定 (5) error 経路の単体テスト | (1)(2) を反映。残りは後続 |
+| 2 | `scripts/fixtures/agent-list-v092.json` と fixture テスト | Turn 2 は合格。Turn 3 向け: A=`herdr_json` error テスト、B=`justfile` に unittest 登録 | B と markdown `` `name` (`pane_id`) `` 表示など |
+| 3 | `test_herdr_json_raises_on_error_payload` ほか fallback / load-fixture テスト（計 10） | ブロッキング指摘なし。コミット時は fixture を含める | テスト緑を確認して完了 |
+
+関連ファイル: `scripts/summarize_herdr_tabs.py`、`scripts/test_summarize_herdr_tabs.py`、`scripts/fixtures/agent-list-v092.json`、`justfile`（`maintenance-test`）。

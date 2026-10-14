@@ -1,0 +1,28 @@
+{
+  "id": "cli:agent:list",
+  "result": {
+    "type": "agent_list",
+    "agents": [
+      {
+        "terminal_id": "w2:t1",
+        "name": "coder",
+        "agent": "cursor",
+        "agent_status": "working",
+        "workspace_id": "w2",
+        "tab_id": "w2:t1",
+        "pane_id": "w2:p1",
+        "focused": true
+      },
+      {
+        "terminal_id": "w2:t2",
+        "name": "reviewer",
+        "agent": "cursor",
+        "agent_status": "idle",
+        "workspace_id": "w2",
+        "tab_id": "w2:t1",
+        "pane_id": "w2:p2",
+        "focused": false
+      }
+    ]
+  }
+}

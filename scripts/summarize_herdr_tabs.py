@@ -3,6 +3,11 @@
 
 Reads workspace/tab/pane metadata via the herdr CLI, then builds a short
 summary from Cursor agent transcripts (when available) and recent pane text.
+
+Each pane row may include ``automation_target``: the handle for
+``herdr agent wait|prompt|read <TARGET>``, taken from ``herdr agent list``
+(renamed ``name``, else ``pane_id``, else ``terminal_id``). This is not the
+same as ``pane.agent`` / detection kind (for example ``cursor``).
 """
 
 from __future__ import annotations
@@ -90,6 +95,7 @@ class PaneSummary:
     tab_number: int | None
     tab_label: str
     pane_id: str
+    automation_target: str | None
     title: str
     agent: str | None
     agent_status: str | None
@@ -195,6 +201,7 @@ def collect_summaries(args: argparse.Namespace) -> list[WorkspaceSummary]:
 
     selected = set(args.workspaces or [])
     transcripts_dir = resolve_transcripts_dir(args.transcripts_dir)
+    automation_targets = load_automation_targets_by_pane(args.herdr)
     out: list[WorkspaceSummary] = []
 
     for ws in workspaces_raw:
@@ -238,6 +245,7 @@ def collect_summaries(args: argparse.Namespace) -> list[WorkspaceSummary]:
                         tab_number=tab.get("number"),
                         tab_label=str(tab.get("label") or tab_id),
                         pane_id="",
+                        automation_target=None,
                         title="",
                         agent=None,
                         agent_status=tab.get("agent_status"),
@@ -266,6 +274,7 @@ def collect_summaries(args: argparse.Namespace) -> list[WorkspaceSummary]:
                         tab=tab,
                         pane=pane,
                         transcripts_dir=transcripts_dir,
+                        automation_targets=automation_targets,
                     )
                 )
 
@@ -283,6 +292,7 @@ def summarize_pane(
     tab: dict[str, Any],
     pane: dict[str, Any],
     transcripts_dir: Path | None,
+    automation_targets: dict[str, str],
 ) -> PaneSummary:
     pane_id = str(pane.get("pane_id") or "")
     title = str(
@@ -315,12 +325,14 @@ def summarize_pane(
                 source = "screen"
 
     summary = compose_summary(title=title, latest_user=latest_user, activity=activity)
+    automation_target = automation_targets.get(pane_id)
     return PaneSummary(
         workspace_id=workspace_id,
         tab_id=str(tab.get("tab_id") or ""),
         tab_number=tab.get("number"),
         tab_label=str(tab.get("label") or tab.get("tab_id") or ""),
         pane_id=pane_id,
+        automation_target=automation_target,
         title=title,
         agent=pane.get("agent"),
         agent_status=pane.get("agent_status") or tab.get("agent_status"),
@@ -332,6 +344,57 @@ def summarize_pane(
         summary=summary,
         source=source,
     )
+
+
+def automation_target_for_agent(agent: dict[str, Any]) -> str | None:
+    name = agent.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    pane_id = agent.get("pane_id")
+    if isinstance(pane_id, str) and pane_id.strip():
+        return pane_id.strip()
+    terminal_id = agent.get("terminal_id")
+    if isinstance(terminal_id, str) and terminal_id.strip():
+        return terminal_id.strip()
+    return None
+
+
+def automation_targets_from_agent_list_payload(payload: dict[str, Any]) -> dict[str, str]:
+    agents = payload.get("result", {}).get("agents") or payload.get("agents") or []
+    targets: dict[str, str] = {}
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        pane_id = str(agent.get("pane_id") or "")
+        target = automation_target_for_agent(agent)
+        if pane_id and target:
+            targets[pane_id] = target
+    return targets
+
+
+def load_automation_targets_by_pane(herdr: str) -> dict[str, str]:
+    try:
+        payload = herdr_json(herdr, ["agent", "list"])
+    except RuntimeError as err:
+        print(
+            f"warn: could not load agent automation targets ({err}); "
+            "continuing without `target` names",
+            file=sys.stderr,
+        )
+        return {}
+    return automation_targets_from_agent_list_payload(payload)
+
+
+def markdown_target_cell(tab: PaneSummary) -> str:
+    target = tab.automation_target
+    pane_id = tab.pane_id
+    if target and pane_id and target != pane_id:
+        return f"`{md_escape(target)}` (`{md_escape(pane_id)}`)"
+    if target:
+        return f"`{md_escape(target)}`"
+    if pane_id:
+        return f"`{md_escape(pane_id)}`"
+    return "-"
 
 
 def compose_summary(*, title: str, latest_user: str | None, activity: str | None) -> str:
@@ -545,6 +608,13 @@ def herdr_json(herdr: str, args: list[str]) -> dict[str, Any]:
         raise RuntimeError(f"invalid JSON from `{herdr} {' '.join(args)}`: {err}") from err
     if not isinstance(payload, dict):
         raise RuntimeError(f"unexpected JSON payload from `{herdr} {' '.join(args)}`")
+    error = payload.get("error")
+    if error is not None:
+        if isinstance(error, dict):
+            code = error.get("code") or "error"
+            message = error.get("message") or error
+            raise RuntimeError(f"herdr API error ({code}): {message}")
+        raise RuntimeError(f"herdr API error: {error}")
     return payload
 
 
@@ -562,8 +632,8 @@ def render_markdown(workspaces: list[WorkspaceSummary]) -> str:
         label = ws.label or ws.workspace_id
         chunks.append(f"## {label} `{ws.workspace_id}`{focus}")
         chunks.append("")
-        chunks.append("| タブ | ラベル / タイトル | やっていること | 状態 |")
-        chunks.append("|------|-------------------|----------------|------|")
+        chunks.append("| タブ | target | ラベル / タイトル | やっていること | 状態 |")
+        chunks.append("|------|--------|-------------------|----------------|------|")
         for tab in ws.tabs:
             num = tab.tab_number if tab.tab_number is not None else "?"
             label_title = f"{tab.tab_label}"
@@ -573,7 +643,7 @@ def render_markdown(workspaces: list[WorkspaceSummary]) -> str:
             status = tab.agent_status or "-"
             agent = tab.agent or "shell"
             chunks.append(
-                f"| **{num}**{focus_mark} | {md_escape(label_title)} | "
+                f"| **{num}**{focus_mark} | {markdown_target_cell(tab)} | {md_escape(label_title)} | "
                 f"{md_escape(tab.summary)} | {agent}/{status} |"
             )
         chunks.append("")
@@ -609,6 +679,8 @@ def render_plain(workspaces: list[WorkspaceSummary]) -> str:
             lines.append(f"tab {num}: {tab.tab_label}{focus_mark}")
             lines.append(f"title: {title}")
             lines.append(f"status: {agent}/{status}")
+            if tab.automation_target:
+                lines.append(f"target: {tab.automation_target}")
             if tab.pane_id:
                 lines.append(f"pane: {tab.pane_id}")
 
