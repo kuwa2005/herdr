@@ -79,6 +79,8 @@ pub(super) fn api_client() -> io::Result<ApiClient> {
                     target.profile.id.as_str(),
                     &target.profile.target,
                     &target.profile.session,
+                    true,
+                    true,
                 )
                 .map_err(|error| {
                     io::Error::new(
@@ -96,6 +98,54 @@ pub(super) fn api_client() -> io::Result<ApiClient> {
             bridge.socket_path().to_owned(),
         )))
     })
+}
+
+pub(super) fn server_status(
+    client: &ApiClient,
+) -> Result<crate::api::RuntimeStatus, crate::api::client::ApiClientError> {
+    let probe = || {
+        if is_remote() {
+            client.status_with_timeout(std::time::Duration::from_secs(15))
+        } else {
+            client.status()
+        }
+    };
+    let error = match probe() {
+        Ok(status) => return Ok(status),
+        Err(error) => error,
+    };
+    // Only this read-only probe may rediscover and retry. Requests that follow
+    // the probe must never be replayed after an ambiguous SSH failure.
+    TARGET.with(|target| {
+        let mut target = target.borrow_mut();
+        let Some(target) = target.as_mut() else {
+            return Err(error);
+        };
+        let Some(bridge) = target.bridge.as_ref() else {
+            return Err(error);
+        };
+        let failure = bridge.reported_failure();
+        let stale_metadata = bridge.used_cached_metadata
+            && failure
+                .as_ref()
+                .is_some_and(crate::remote::SavedSshApiBridge::stale_metadata_failure);
+        if !bridge.can_retry || (!stale_metadata && !bridge.recover_transport()) {
+            return Err(failure.map(Into::into).unwrap_or(error));
+        }
+        if stale_metadata {
+            bridge.invalidate_metadata();
+        }
+        target.bridge.take();
+        target.bridge = Some(crate::remote::SavedSshApiBridge::start(
+            target.profile.id.as_str(),
+            &target.profile.target,
+            &target.profile.session,
+            !stale_metadata,
+            false,
+        )?);
+        Ok(())
+    })?;
+    probe()
 }
 
 pub(super) fn remote_error(error: io::Error) -> io::Error {
@@ -211,7 +261,7 @@ fn parse_machine_prefix(args: &[String]) -> Result<Option<(String, Vec<String>)>
     Ok(Some((machine, cleaned)))
 }
 
-fn resolve_machine<'a>(
+pub(super) fn resolve_machine<'a>(
     profiles: &'a [SavedSshEndpoint],
     selector: &str,
 ) -> Result<&'a SavedSshEndpoint, String> {
