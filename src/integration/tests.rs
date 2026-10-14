@@ -1461,20 +1461,11 @@ fn install_codex_writes_hook_and_updates_hooks_and_config() {
         .as_str()
         .unwrap()
         .contains(" session"));
-    assert!(hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" working"));
+    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" idle"));
-    assert!(hooks["hooks"]["Interrupt"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" idle"));
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
     assert!(config.contains("model = \"gpt-5.4\""));
     assert!(config.contains("[features]"));
     assert!(config.contains("hooks = true"));
@@ -1525,14 +1516,11 @@ fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
     let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
     assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        hooks["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
-        1
-    );
+    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert_eq!(hooks["hooks"]["Stop"].as_array().unwrap().len(), 1);
-    assert_eq!(hooks["hooks"]["Interrupt"].as_array().unwrap().len(), 1);
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
     assert_eq!(config.matches("hooks = true").count(), 1);
     assert!(!config.contains("codex_hooks"));
     assert!(config.contains("other = true"));
@@ -1561,6 +1549,49 @@ fn install_codex_only_migrates_top_level_feature_flags() {
 
     assert!(config.contains("[profiles.work.features]\nhooks = false\ncodex_hooks = false"));
     assert!(config.contains("[features]\nhooks = true\nother = true"));
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codex_removes_turn_status_hooks_from_previous_integration() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
+    let hook = |action| json!({"type": "command", "command": hook_command(&hook_path, Some(action)), "timeout": 10});
+    let hooks = json!({
+        "hooks": {
+            "SessionStart": [{"hooks": [hook("session")]}],
+            "UserPromptSubmit": [{"hooks": [
+                hook("working"),
+                {"type": "command", "command": "echo keep", "timeout": 10}
+            ]}],
+            "Stop": [{"hooks": [hook("idle")]}],
+            "Interrupt": [{"hooks": [hook("idle")]}]
+        }
+    });
+    fs::write(
+        codex_dir.join("hooks.json"),
+        serde_json::to_string(&hooks).unwrap(),
+    )
+    .unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_codex().unwrap();
+
+    let hooks: Value =
+        serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap()).unwrap();
+    assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        hooks["hooks"]["UserPromptSubmit"][0]["hooks"],
+        json!([{"type": "command", "command": "echo keep", "timeout": 10}])
+    );
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
 
     std::env::remove_var("HOME");
     let _ = fs::remove_dir_all(base);
