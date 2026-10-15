@@ -13,7 +13,7 @@ description: >-
 ## 人間向け（UI）
 
 ペインを右クリック → **ターン制を開始...** → goal / turns（既定 5）を入力して開始。  
-ネスト session 上で coder / reviewer が回り、終了後に呼び出し元へサマリーが届く。
+ネスト session の 2x2 上で director / coder / reviewer が回り、終了後に呼び出し元へサマリーが届く。
 
 ## 前提（エージェント CLI）
 
@@ -23,9 +23,9 @@ test "${HERDR_ENV:-}" = 1
 
 失敗したら Herdr 管理ペイン外である旨を伝えて停止。N は **1〜10**。それ以上や無制限は拒否。
 
-## 既定動作（ネスト + coder/reviewer）
+## 既定動作（ネスト 2x2 + director/coder/reviewer）
 
-`--from-here` は隣ペインにネスト Herdr を立ち上げ、その中で **coder** と **reviewer** の 2 エージェントを起動してターンを回す。
+`--from-here` は隣ペインにネスト Herdr を立ち上げ、その中を **2x2** に分割して **director**（計画）/ **coder**（実装）/ **reviewer**（レビュー）を起動する（右下 spare はシェルのみ）。
 
 ## 起動（デッドロック回避）
 
@@ -49,7 +49,7 @@ herdr-turns --from-here --daemon --turns N --goal "SHORT GOAL" --workdir "$PWD"
 
 ## 各ターン
 
-1. INSTRUCT → `TURN{n}_PLAN.md`（`TASK` など）— planner（既定: coder）
+1. INSTRUCT → `TURN{n}_PLAN.md`（`TASK` など）— director（`--planner` で上書き可）
 2. FIX → `TURN{n}_RESULT.md`（`DONE` / `VERIFIED`）— coder
 3. REVIEW → `VERDICT` / `IMPROVE` / `EFFECT` — reviewer
 4. `REVISE` のときだけ APPLY — coder

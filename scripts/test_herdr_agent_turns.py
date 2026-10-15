@@ -34,6 +34,7 @@ class HerdrAgentTurnsTests(unittest.TestCase):
             prev_result_path=None,
         )
         self.assertIn("Turn 1/10 INSTRUCT", first)
+        self.assertIn("director / planning", first)
         self.assertIn("TURN1_PLAN.md", first)
         self.assertIn("first turn", first.lower())
 
@@ -219,13 +220,109 @@ class HerdrAgentTurnsTests(unittest.TestCase):
         self.assertIn("SUMMARY.md", text)
         self.assertIn("# 自己改善レポート", text)
 
+    def test_assign_nested_2x2_panes_layout(self) -> None:
+        roles = turns.assign_nested_2x2_panes("p1", "p2", "p3", "p4")
+        self.assertEqual(
+            roles,
+            {
+                "director": "p1",
+                "coder": "p2",
+                "reviewer": "p3",
+                "spare": "p4",
+            },
+        )
+
+    def test_spawn_nested_builds_2x2_and_starts_director_team(self) -> None:
+        calls: list[tuple[list[str], dict | None]] = []
+        split_ids = iter(["outer", "coder-pane", "reviewer-pane", "spare-pane"])
+
+        def fake_herdr_json(herdr: str, argv: list[str], env=None) -> dict:
+            del herdr
+            calls.append((list(argv), env))
+            if argv[:2] == ["pane", "split"]:
+                pane_id = next(split_ids)
+                return {"result": {"pane": {"pane_id": pane_id}}}
+            if argv[:2] == ["agent", "start"]:
+                return {"ok": True}
+            raise AssertionError(f"unexpected herdr_json {argv}")
+
+        def fake_herdr_run(herdr: str, argv: list[str], *, env=None, allow_empty=False):
+            del herdr, allow_empty
+            calls.append((list(argv), env))
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp)
+            (notes / "launcher-pane").write_text("parent:p0\n", encoding="utf-8")
+            (notes / "launcher-herdr-env").write_text("1\n", encoding="utf-8")
+            with (
+                mock.patch.object(turns, "herdr_json", side_effect=fake_herdr_json),
+                mock.patch.object(turns, "herdr_run", side_effect=fake_herdr_run),
+                mock.patch.object(
+                    turns,
+                    "wait_for_session_panes",
+                    return_value=[{"pane_id": "root-pane"}],
+                ),
+                mock.patch.dict(os.environ, {"HERDR_ENV": "1"}, clear=False),
+            ):
+                nested = turns.spawn_nested_coder_reviewer(
+                    "herdr",
+                    workdir=Path(tmp),
+                    kind="cursor",
+                    agent_args=["--yolo"],
+                    parent_pane_id="parent:p0",
+                    notes_dir=notes,
+                )
+
+        self.assertEqual(nested.director, "director")
+        self.assertEqual(nested.planner, "director")
+        self.assertEqual(nested.coder, "coder")
+        self.assertEqual(nested.reviewer, "reviewer")
+        self.assertEqual(nested.spare_pane_id, "spare-pane")
+        self.assertEqual(nested.outer_pane_id, "outer")
+
+        agent_starts = [
+            argv for argv, _env in calls if argv[:2] == ["agent", "start"]
+        ]
+        self.assertEqual(
+            [argv[2] for argv in agent_starts],
+            ["director", "coder", "reviewer"],
+        )
+        self.assertEqual(
+            [argv[argv.index("--pane") + 1] for argv in agent_starts],
+            ["root-pane", "coder-pane", "reviewer-pane"],
+        )
+        renames = [
+            argv for argv, _env in calls if argv[:2] == ["pane", "rename"]
+        ]
+        self.assertEqual(
+            [(argv[2], argv[3]) for argv in renames],
+            [
+                ("root-pane", "director"),
+                ("coder-pane", "coder"),
+                ("reviewer-pane", "reviewer"),
+                ("spare-pane", "spare"),
+            ],
+        )
+        nested_splits = [
+            argv
+            for argv, env in calls
+            if argv[:2] == ["pane", "split"] and env is not None
+        ]
+        self.assertEqual(
+            [argv[argv.index("--direction") + 1] for argv in nested_splits],
+            ["right", "down", "down"],
+        )
+
     def test_cleanup_nested_pair_stops_session_and_closes_pane(self) -> None:
         nested = turns.NestedPair(
             session="turns-demo",
             outer_pane_id="w2:p9",
+            director="director",
             coder="coder",
             reviewer="reviewer",
-            planner="coder",
+            planner="director",
+            spare_pane_id="w1:p4",
             config_path=Path("/tmp/cfg.toml"),
             work_root=Path("/tmp/work"),
         )
@@ -270,17 +367,22 @@ class HerdrAgentTurnsTests(unittest.TestCase):
                 prompted.append((target, text))
                 self.assertEqual(timeout_ms, 600_000)
 
-            with mock.patch.object(turns, "resolve_agent_in_pane", side_effect=fake_resolve):
-                with mock.patch.object(
+            with (
+                mock.patch.dict(os.environ, {"HERDR_PANE_ID": ""}, clear=False),
+                mock.patch.object(
+                    turns, "resolve_agent_in_pane", side_effect=fake_resolve
+                ),
+                mock.patch.object(
                     turns, "prompt_and_wait", side_effect=fake_prompt_and_wait
-                ):
-                    turns.deliver_summary_to_caller(
-                        "herdr",
-                        "# summary body\n",
-                        report_path=Path("/work/自己改善.md"),
-                        notes_dir=notes,
-                        timeout_ms=600_000,
-                    )
+                ),
+            ):
+                turns.deliver_summary_to_caller(
+                    "herdr",
+                    "# summary body\n",
+                    report_path=Path("/work/自己改善.md"),
+                    notes_dir=notes,
+                    timeout_ms=600_000,
+                )
             self.assertEqual(len(prompted), 1)
             self.assertEqual(prompted[0][0], "launcher-agent")
             self.assertIn("# summary body", prompted[0][1])

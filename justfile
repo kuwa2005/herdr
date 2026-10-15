@@ -265,7 +265,7 @@ default-config:
 tabs-summary *args:
     {{python}} scripts/summarize_herdr_tabs.py {{args}}
 
-# Self-evolve turns (instruct→fix→review). Default --from-here nests coder+reviewer.
+# Self-evolve turns (instruct→fix→review). Default --from-here nests 2x2 director/coder/reviewer.
 # Example: just agent-turns --from-here --daemon --turns 5 --goal "..."
 agent-turns *args:
     {{python}} scripts/herdr_agent_turns.py {{args}}

@@ -93,17 +93,17 @@ install -m 755 scripts/herdr_agent_turns.py ~/.local/bin/herdr_agent_turns.py
 3. `herdrdev/herdr` への実装 PR・機能 Issue は開かない（CONTRIBUTING / AGENTS の外部貢献ガードを維持）。
 4. upstream 由来の再現バグを本家に報告する場合だけ、人間が CONTRIBUTING のバグテンプレート手順に従う。
 
-## セッションジャーナル（`{session_id}.md`）
+## セッションジャーナル（`herdrlog.md`）
 
 `[session] journal = true`（既定）のとき、次の両方に同じ内容を追記します。
 
 1. セッションデータディレクトリ
-2. Herdr サーバプロセスのカレントディレクトリ（`./{session_id}.md`）
+2. Herdr サーバプロセスのカレントディレクトリ（`./herdrlog.md`）
 
 | セッション | データディレクトリ例 | カレント例 |
 | --- | --- | --- |
-| default | `~/.config/herdr/default.md` | `./default.md` |
-| 名前付き `demo` | `~/.config/herdr/sessions/demo/demo.md` | `./demo.md` |
+| default | `~/.config/herdr/herdrlog.md` | `./herdrlog.md` |
+| 名前付き `demo` | `~/.config/herdr/sessions/demo/herdrlog.md` | `./herdrlog.md` |
 
 記録内容:
 
@@ -125,10 +125,10 @@ Herdr 本体に「A→B 自動パイプ」はない。この fork の公式ワ�
 
 ### 1 ターンの流れ
 
-1. **INSTRUCT** — `TURN{n}_PLAN.md`（`STATUS` / `TASK` / `DONE_WHEN`）
-2. **FIX** — `TURN{n}_RESULT.md`（`DONE` / `VERIFIED` / `FILES`）
-3. **REVIEW** — `TURN{n}_REVIEW.md`（`VERDICT` / `IMPROVE` / `EFFECT`）
-4. **APPLY** — `VERDICT: REVISE` のときだけ
+1. **INSTRUCT**（director）— `TURN{n}_PLAN.md`（`STATUS` / `TASK` / `DONE_WHEN`）
+2. **FIX**（coder）— `TURN{n}_RESULT.md`（`DONE` / `VERIFIED` / `FILES`）
+3. **REVIEW**（reviewer）— `TURN{n}_REVIEW.md`（`VERDICT` / `IMPROVE` / `EFFECT`）
+4. **APPLY**（coder）— `VERDICT: REVISE` のときだけ
 5. 次ターンの INSTRUCT が直前レビューを読み、さらなる指示を出す
 
 制約: `--turns` は **1〜10**（既定 10）。`VERDICT: DONE` または `STATUS: DONE` で早期終了。
@@ -143,12 +143,12 @@ herdr-turns --from-here --daemon --turns 5 --goal "エラー処理を改善す�
 既定（`--from-here`）:
 
 1. 隣ペインにネスト Herdr（名前付きセッション `turns-YYYYMMDDHHMMSS`）を起動
-2. その中で `coder` / `reviewer` の 2 エージェントを起動（`--kind`、既定 `cursor`）
-3. ターンをそのペアに対して回す
+2. ネスト内を 2x2 に分割し、`director` / `coder` / `reviewer` を起動（右下 spare はシェル。`--kind` 既定 `cursor`）
+3. INSTRUCT→director、FIX/APPLY→coder、REVIEW→reviewer でターンを回す
 
 | フラグ | 意味 |
 | --- | --- |
-| `--from-here` | ネスト Herdr + coder/reviewer を立ち上げて回す |
+| `--from-here` | ネスト Herdr + 2x2 director/coder/reviewer を立ち上げて回す |
 | `--self` | 旧挙動: 現在ペインのエージェントだけで自己レビュー |
 | `--daemon` | バックグラウンド起動（前景待ちはデッドロックする） |
 | `--kind` / `--agent-arg` | ネストエージェントの種別と追加引数（既定: `cursor` + `--yolo`） |

@@ -406,7 +406,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
 # Append agent.prompt inputs and finished (working→idle) pane reports to
-# `{session_id}.md` under the session data directory and the server cwd
+# `herdrlog.md` under the session data directory and the server cwd
 # (default: true).
 # journal = true
 

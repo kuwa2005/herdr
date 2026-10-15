@@ -853,7 +853,7 @@ pub struct AppState {
     pub pane_scrollback_limit_bytes: usize,
     pub sound: SoundConfig,
     pub toast_config: ToastConfig,
-    /// When true, append instructions and completion reports to `{session_id}.md`.
+    /// When true, append instructions and completion reports to `herdrlog.md`.
     pub session_journal: bool,
     pub keybinds: Keybinds,
     /// UI color palette — all sidebar/UI colors centralized for theming.

@@ -1,8 +1,8 @@
 //! Append-only markdown journal of session instructions and agent completions.
 //!
 //! Written to both:
-//! - `{session_data_dir}/{session_id}.md` (for example `~/.config/herdr/default.md`)
-//! - `{cwd}/{session_id}.md` (server process current directory)
+//! - `{session_data_dir}/herdrlog.md` (for example `~/.config/herdr/herdrlog.md`)
+//! - `{cwd}/herdrlog.md` (server process current directory)
 //!
 //! Instructions come from `agent.prompt` and from TUI typing in agent panes
 //! (buffered until Enter). Writes are best-effort and never fail the caller.
@@ -18,6 +18,8 @@ use time::OffsetDateTime;
 
 const COMPLETION_REPORT_MAX_CHARS: usize = 4_000;
 const DRAFT_MAX_CHARS: usize = 8_000;
+/// Fixed journal filename (not the session id — avoids `default.md` clutter).
+pub const JOURNAL_FILENAME: &str = "herdrlog.md";
 
 /// Per-pane draft buffer for TUI keystrokes until Enter submits them.
 #[derive(Debug, Default)]
@@ -68,24 +70,24 @@ impl InstructionDrafts {
     }
 }
 
-/// Session id used in the journal filename (`default` when unnamed).
+/// Session id recorded in the journal header (`default` when unnamed).
 pub fn session_id() -> String {
     crate::session::active_name().unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned())
 }
 
-/// Path to `{session_id}.md` under the active session data directory.
+/// Path to `herdrlog.md` under the active session data directory.
 pub fn journal_path() -> PathBuf {
-    journal_path_for(&session_id(), &crate::session::data_dir())
+    journal_path_in(&crate::session::data_dir())
 }
 
-/// Path to `{session_id}.md` under the server process current directory.
+/// Path to `herdrlog.md` under the server process current directory.
 pub fn cwd_journal_path() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
-    Some(journal_path_for(&session_id(), &cwd))
+    Some(journal_path_in(&cwd))
 }
 
-pub fn journal_path_for(session_id: &str, dir: &Path) -> PathBuf {
-    dir.join(format!("{session_id}.md"))
+pub fn journal_path_in(dir: &Path) -> PathBuf {
+    dir.join(JOURNAL_FILENAME)
 }
 
 /// Destinations that should receive the same journal append (deduped by path).
@@ -262,16 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn journal_path_uses_session_id_filename() {
+    fn journal_path_uses_fixed_herdrlog_filename() {
         let dir = PathBuf::from("/tmp/herdr-sess");
         assert_eq!(
-            journal_path_for("demo", &dir),
-            PathBuf::from("/tmp/herdr-sess/demo.md")
+            journal_path_in(&dir),
+            PathBuf::from("/tmp/herdr-sess/herdrlog.md")
         );
-        assert_eq!(
-            journal_path_for("default", &dir),
-            PathBuf::from("/tmp/herdr-sess/default.md")
-        );
+        assert_eq!(JOURNAL_FILENAME, "herdrlog.md");
     }
 
     #[test]
@@ -305,11 +304,12 @@ mod tests {
     #[test]
     fn append_writes_header_once() {
         let dir = temp_dir();
-        let path = journal_path_for("default", &dir);
+        let path = journal_path_in(&dir);
         append_block(&path, "default", "## 指示 · t1\n\nhello\n").expect("first");
         append_block(&path, "default", "## 完了 · t2\n\ndone\n").expect("second");
         let body = fs::read_to_string(&path).expect("read");
         assert_eq!(body.matches("# Session journal: default").count(), 1);
+        assert!(path.ends_with("herdrlog.md"));
         assert!(body.contains("## 指示 · t1"));
         assert!(body.contains("## 完了 · t2"));
         let _ = fs::remove_dir_all(dir);
@@ -325,11 +325,11 @@ mod tests {
 
     #[test]
     fn paths_equal_matches_identical_paths() {
-        let a = PathBuf::from("/tmp/herdr-a/default.md");
+        let a = PathBuf::from("/tmp/herdr-a/herdrlog.md");
         assert!(paths_equal(&a, &a));
         assert!(!paths_equal(
             &a,
-            &PathBuf::from("/tmp/herdr-b/default.md")
+            &PathBuf::from("/tmp/herdr-b/herdrlog.md")
         ));
     }
 

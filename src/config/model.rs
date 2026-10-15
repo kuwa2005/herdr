@@ -301,7 +301,7 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
-    /// Append instructions and agent completion reports to `{session_id}.md`
+    /// Append instructions and agent completion reports to `herdrlog.md`
     /// under the session data directory. Default: true.
     pub journal: bool,
 }
