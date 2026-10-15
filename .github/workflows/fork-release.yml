@@ -260,7 +260,10 @@ jobs:
           ### kuwa2005/herdr fork (${VERSION})
           - Multi-platform binaries built by Fork Release workflow.
           - Japanese UI/CLI via \`[ui].language = "ja"\` (and \`en\` / \`zh-cn\`).
+          - Self-evolve turns: \`herdr-turns --from-here --daemon --turns N --goal "..."\` (max 10; effectiveness report \`自己改善yyyymmddhhmmss.md\`).
           - Oimo agent screen detection included when present in this tree.
+
+          Install:
 
           \`\`\`bash
           curl -fsSL https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.sh | sh
