@@ -92,6 +92,30 @@ install -m 755 scripts/herdr-turns ~/.local/bin/herdr-turns
 3. `herdrdev/herdr` への実装 PR・機能 Issue は開かない（CONTRIBUTING / AGENTS の外部貢献ガードを維持）。
 4. upstream 由来の再現バグを本家に報告する場合だけ、人間が CONTRIBUTING のバグテンプレート手順に従う。
 
+## セッションジャーナル（`{session_id}.md`）
+
+`[session] journal = true`（既定）のとき、次の両方に同じ内容を追記します。
+
+1. セッションデータディレクトリ
+2. Herdr サーバプロセスのカレントディレクトリ（`./{session_id}.md`）
+
+| セッション | データディレクトリ例 | カレント例 |
+| --- | --- | --- |
+| default | `~/.config/herdr/default.md` | `./default.md` |
+| 名前付き `demo` | `~/.config/herdr/sessions/demo/demo.md` | `./demo.md` |
+
+記録内容:
+
+1. **指示** — `herdr agent prompt` で送ったテキスト
+2. **完了** — エージェントが working/blocked → idle になったときの検出バッファ（または直近出力）レポート
+
+無効化:
+
+```toml
+[session]
+journal = false
+```
+
 ## マルチエージェント自動化（自己進化）
 
 Herdr 本体に「A→B 自動パイプ」はない。この fork の公式ワークフローは **最大 10 ターンの自己進化ループ**。

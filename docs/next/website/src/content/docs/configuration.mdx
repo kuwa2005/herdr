@@ -555,6 +555,9 @@ Herdr resumes supported Agent conversations after a server restart by default:
 ```toml
 [session]
 resume_agents_on_restore = true
+# Append agent.prompt inputs and finished reports to {session_id}.md
+# under the session data directory and the server cwd (default: true)
+journal = true
 startup_per_agent_delay_ms = 100
 ```
 

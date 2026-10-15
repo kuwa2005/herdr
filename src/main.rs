@@ -53,6 +53,7 @@ mod render_signal;
 mod selection;
 mod server;
 mod session;
+mod session_journal;
 mod sound;
 mod terminal;
 mod terminal_effects;
@@ -404,6 +405,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
+# Append agent.prompt inputs and finished (working→idle) pane reports to
+# `{session_id}.md` under the session data directory and the server cwd
+# (default: true).
+# journal = true
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

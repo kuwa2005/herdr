@@ -1,6 +1,61 @@
 use super::*;
 
+fn agent_state_label(state: crate::detect::AgentState) -> &'static str {
+    match state {
+        crate::detect::AgentState::Idle => "idle",
+        crate::detect::AgentState::Working => "working",
+        crate::detect::AgentState::Blocked => "blocked",
+        crate::detect::AgentState::Unknown => "unknown",
+    }
+}
+
 impl HeadlessServer {
+    fn record_session_journal_completion(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        previous_state: crate::detect::AgentState,
+        state: crate::detect::AgentState,
+        agent_label: Option<&str>,
+    ) {
+        if !self.app.state.session_journal {
+            return;
+        }
+        let Some(agent_label) = agent_label else {
+            return;
+        };
+        let public_pane_id = self.app.public_pane_id(ws_idx, pane_id);
+        let report = self
+            .app
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| {
+                ws.tabs
+                    .iter()
+                    .find_map(|tab| tab.panes.get(&pane_id))
+                    .map(|pane| pane.attached_terminal_id.clone())
+            })
+            .and_then(|terminal_id| self.app.terminal_runtimes.get(&terminal_id))
+            .map(|runtime| {
+                let detection = runtime.detection_text();
+                if detection.trim().is_empty() {
+                    runtime.recent_unwrapped_text_snapshot(40).text
+                } else {
+                    detection
+                }
+            })
+            .unwrap_or_else(|| "_(no pane text)_".to_owned());
+        crate::session_journal::record_completion(
+            true,
+            agent_label,
+            public_pane_id.as_deref(),
+            agent_state_label(previous_state),
+            agent_state_label(state),
+            &report,
+        );
+    }
+
     fn pane_effective_state(&self, pane_id: crate::layout::PaneId) -> crate::detect::AgentState {
         self.app
             .state
@@ -52,6 +107,15 @@ impl HeadlessServer {
         else {
             return false;
         };
+        if matches!(kind, crate::app::state::ToastKind::Finished) {
+            self.record_session_journal_completion(
+                ws_idx,
+                pane_id,
+                previous_state,
+                state,
+                agent_label.or(previous_agent_label),
+            );
+        }
         let Some(workspace) = self.app.state.workspaces.get(ws_idx) else {
             return false;
         };

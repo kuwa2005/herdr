@@ -127,6 +127,13 @@ impl App {
         }
         match self.submit_agent_prompt(validated, &params) {
             Ok(submission) => {
+                let (_, agent, _) = &submission;
+                crate::session_journal::record_instruction(
+                    self.state.session_journal,
+                    &params.target,
+                    Some(agent.pane_id.as_str()),
+                    &params.text,
+                );
                 let _ = handoff_tx.send(submission);
             }
             Err(response) => {

@@ -551,6 +551,9 @@ kitty_graphics = false
 ```toml
 [session]
 resume_agents_on_restore = true
+# 将 agent.prompt 输入与完成报告追加到 {session_id}.md
+# （会话数据目录与服务器 cwd；默认: true）
+journal = true
 startup_per_agent_delay_ms = 100
 ```
 

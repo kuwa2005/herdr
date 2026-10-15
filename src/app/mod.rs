@@ -553,6 +553,7 @@ impl App {
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             sound: config.ui.sound.clone(),
             toast_config: config.ui.toast.clone(),
+            session_journal: config.session.journal,
             keybinds: config.keybinds(),
             palette: theme_palette,
             theme_name,
@@ -918,6 +919,10 @@ impl App {
                 self.state.sound = config.ui.sound.clone();
                 self.state.toast_config = config.ui.toast.clone();
             }
+        }
+
+        if !invalid_section("session") {
+            self.state.session_journal = config.session.journal;
         }
 
         if !invalid_section("session")

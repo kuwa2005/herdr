@@ -558,6 +558,9 @@ Herdr はデフォルトで、サーバーの再起動後に対応する Agent �
 ```toml
 [session]
 resume_agents_on_restore = true
+# agent.prompt の入力と完了時レポートを {session_id}.md に追記
+# （セッションデータディレクトリとサーバ cwd。既定: true）
+journal = true
 startup_per_agent_delay_ms = 100
 ```
 
