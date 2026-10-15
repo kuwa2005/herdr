@@ -573,6 +573,10 @@ impl ClientShellState {
                         ..
                     }
                 ))
+                | Some(ClientShellOverlay::StartTurns(ClientStartTurnsOverlay {
+                    starting: false,
+                    ..
+                }))
                 | Some(ClientShellOverlay::Navigator(ClientNavigatorOverlay {
                     search_focused: true,
                     ..

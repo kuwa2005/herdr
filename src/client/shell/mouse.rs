@@ -1448,6 +1448,7 @@ impl ClientShellState {
                 ClientShellOverlay::WorktreeCreate(_)
                     | ClientShellOverlay::WorktreeOpen(_)
                     | ClientShellOverlay::WorktreeRemove(_)
+                    | ClientShellOverlay::StartTurns(_)
             )
         ) {
             match mouse.kind {
@@ -1475,6 +1476,8 @@ impl ClientShellState {
                                         ClientWorktreeOpenOverlay { opening: true, .. }
                                     ) | ClientShellOverlay::WorktreeRemove(
                                         ClientWorktreeRemoveOverlay { removing: true, .. }
+                                    ) | ClientShellOverlay::StartTurns(
+                                        ClientStartTurnsOverlay { starting: true, .. }
                                     )
                                 )
                             );
@@ -1488,6 +1491,12 @@ impl ClientShellState {
                             open.search_focused = true;
                             outcome.repaint = true;
                         }
+                    } else if super::contains(self.hits.start_turns_goal, point) {
+                        self.focus_start_turns_field(ClientStartTurnsField::Goal);
+                        outcome.repaint = true;
+                    } else if super::contains(self.hits.start_turns_turns, point) {
+                        self.focus_start_turns_field(ClientStartTurnsField::Turns);
+                        outcome.repaint = true;
                     } else if let Some((_, index)) = self
                         .hits
                         .worktree_rows
@@ -1510,6 +1519,9 @@ impl ClientShellState {
                             }
                             Some(ClientShellOverlay::WorktreeRemove(_)) => {
                                 self.submit_worktree_remove(outcome)
+                            }
+                            Some(ClientShellOverlay::StartTurns(_)) => {
+                                self.submit_start_turns(outcome)
                             }
                             _ => {}
                         }

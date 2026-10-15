@@ -448,6 +448,9 @@ impl ClientShellState {
         if self.insert_worktree_overlay_text(text) {
             return true;
         }
+        if self.insert_start_turns_overlay_text(text) {
+            return true;
+        }
         match self.overlay.as_mut() {
             Some(ClientShellOverlay::Rename(rename)) => {
                 rename.input.insert(text);
@@ -626,6 +629,9 @@ impl ClientShellState {
         }
 
         if self.route_worktree_overlay_key(key, outcome) {
+            return;
+        }
+        if self.route_start_turns_overlay_key(key, outcome) {
             return;
         }
         if matches!(self.overlay, Some(ClientShellOverlay::Navigator(_))) {

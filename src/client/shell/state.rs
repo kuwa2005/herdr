@@ -119,6 +119,8 @@ pub(super) struct ShellHitMap {
     pub(super) overlay_primary: Rect,
     pub(super) overlay_clear: Rect,
     pub(super) overlay_cancel: Rect,
+    pub(super) start_turns_goal: Rect,
+    pub(super) start_turns_turns: Rect,
     pub(super) navigator_popup: Rect,
     pub(super) navigator_search: Rect,
     pub(super) navigator_rows: Vec<(Rect, ClientNavigatorTarget)>,
@@ -289,6 +291,7 @@ pub(super) enum ClientShellOverlayKind {
     WorktreeCreate,
     WorktreeOpen,
     WorktreeRemove,
+    StartTurns,
     ContextMenu,
     GlobalMenu,
     Settings,
@@ -437,6 +440,23 @@ pub(super) struct ClientWorktreeCreateOverlay {
     pub(super) creating: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClientStartTurnsField {
+    Goal,
+    Turns,
+}
+
+#[derive(Debug)]
+pub(super) struct ClientStartTurnsOverlay {
+    pub(super) pane_id: String,
+    pub(super) workdir: String,
+    pub(super) goal: TextEditor,
+    pub(super) turns: TextEditor,
+    pub(super) focused: ClientStartTurnsField,
+    pub(super) error: Option<String>,
+    pub(super) starting: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ClientWorktreeOpenEntry {
     pub(super) path: String,
@@ -529,6 +549,7 @@ pub(super) enum ClientContextMenuAction {
     SplitDown,
     Zoom,
     ToggleRightClickPassthrough,
+    StartTurns,
     ClosePane,
 }
 
@@ -596,6 +617,7 @@ pub(super) enum ClientShellOverlay {
     WorktreeCreate(ClientWorktreeCreateOverlay),
     WorktreeOpen(ClientWorktreeOpenOverlay),
     WorktreeRemove(ClientWorktreeRemoveOverlay),
+    StartTurns(ClientStartTurnsOverlay),
     ContextMenu(ClientContextMenuOverlay),
     GlobalMenu(ClientGlobalMenuOverlay),
     Settings(ClientSettingsOverlay),
@@ -614,6 +636,7 @@ impl ClientShellOverlay {
             Self::WorktreeCreate(_) => ClientShellOverlayKind::WorktreeCreate,
             Self::WorktreeOpen(_) => ClientShellOverlayKind::WorktreeOpen,
             Self::WorktreeRemove(_) => ClientShellOverlayKind::WorktreeRemove,
+            Self::StartTurns(_) => ClientShellOverlayKind::StartTurns,
             Self::ContextMenu(_) => ClientShellOverlayKind::ContextMenu,
             Self::GlobalMenu(_) => ClientShellOverlayKind::GlobalMenu,
             Self::Settings(_) => ClientShellOverlayKind::Settings,

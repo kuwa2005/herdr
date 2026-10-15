@@ -384,6 +384,78 @@ fn context_menus_capture_stable_targets_and_route_actions() {
 }
 
 #[test]
+fn pane_context_menu_opens_start_turns_overlay() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed frame");
+    let pane = state.hits.panes[0].rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x + 1,
+        row: pane.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.compose(106, 20).expect("pane context menu");
+    let start_index = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu
+            .items(crate::config::UiLanguage::En)
+            .iter()
+            .position(|item| item.action == ClientContextMenuAction::StartTurns)
+            .expect("start turns item"),
+        _ => panic!("pane context menu"),
+    };
+    let start = state.hits.context_menu_rows[start_index].0;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: start.x + 1,
+        row: start.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::StartTurns(overlay)) => {
+            assert_eq!(overlay.pane_id, "pane_1");
+            assert_eq!(overlay.workdir, "/repo");
+            assert_eq!(overlay.turns.as_str(), "5");
+            assert_eq!(overlay.focused, ClientStartTurnsField::Goal);
+            assert!(overlay.goal.as_str().is_empty());
+        }
+        other => panic!("expected start turns overlay, got {other:?}"),
+    }
+
+    state.compose(106, 20).expect("start turns overlay");
+    assert!(state.hits.start_turns_goal.width > 0);
+    assert!(state.hits.start_turns_turns.width > 0);
+    assert!(state.hits.overlay_primary.width > 0);
+
+    // Empty goal should fail validation without spawning.
+    state.submit_start_turns(&mut ClientShellInput::default());
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::StartTurns(overlay)) => {
+            assert_eq!(overlay.error.as_deref(), Some("goal is required"));
+            assert!(!overlay.starting);
+        }
+        other => panic!("overlay should remain open on validation error, got {other:?}"),
+    }
+
+    state.insert_start_turns_overlay_text("stabilize turns UX");
+    state.focus_start_turns_field(ClientStartTurnsField::Turns);
+    if let Some(ClientShellOverlay::StartTurns(overlay)) = state.overlay.as_mut() {
+        overlay.turns = TextEditor::new("11", true);
+    }
+    state.submit_start_turns(&mut ClientShellInput::default());
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::StartTurns(overlay)) => {
+            assert!(overlay
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("turns must be")));
+        }
+        other => panic!("overlay should remain open on turns validation error, got {other:?}"),
+    }
+}
+
+#[test]
 fn global_menu_opens_from_sidebar_and_routes_client_actions() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));

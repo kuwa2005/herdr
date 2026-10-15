@@ -128,6 +128,7 @@ class HerdrAgentTurnsTests(unittest.TestCase):
         args = turns.build_parser().parse_args(
             [
                 "--from-here",
+                "--self",
                 "--goal",
                 "g",
                 "--dry-run",
@@ -137,10 +138,29 @@ class HerdrAgentTurnsTests(unittest.TestCase):
             planner, coder, reviewer = turns.resolve_roles(args)
         self.assertEqual((planner, coder, reviewer), ("me", "me", "me"))
 
-    def test_resolve_roles_from_here_with_separate_reviewer(self) -> None:
+    def test_wants_nested_pair_default_from_here(self) -> None:
+        nested = turns.build_parser().parse_args(
+            ["--from-here", "--goal", "g", "--dry-run"]
+        )
+        self.assertTrue(turns.wants_nested_pair(nested))
+        self_mode = turns.build_parser().parse_args(
+            ["--from-here", "--self", "--goal", "g", "--dry-run"]
+        )
+        self.assertFalse(turns.wants_nested_pair(self_mode))
+
+    def test_default_agent_args_include_yolo(self) -> None:
+        self.assertEqual(turns.DEFAULT_AGENT_KIND, "cursor")
+        self.assertEqual(turns.DEFAULT_AGENT_ARGS, ["--yolo"])
+        args = turns.build_parser().parse_args(
+            ["--from-here", "--goal", "g", "--dry-run"]
+        )
+        self.assertIsNone(args.agent_args)
+
+    def test_resolve_roles_from_here_self_with_separate_reviewer(self) -> None:
         args = turns.build_parser().parse_args(
             [
                 "--from-here",
+                "--self",
                 "--reviewer",
                 "reviewer",
                 "--goal",
@@ -151,6 +171,131 @@ class HerdrAgentTurnsTests(unittest.TestCase):
         with mock.patch.object(turns, "resolve_from_here", return_value="me"):
             planner, coder, reviewer = turns.resolve_roles(args)
         self.assertEqual((planner, coder, reviewer), ("me", "me", "reviewer"))
+
+    def test_session_cli_env_unsets_parent_ids(self) -> None:
+        env = turns.session_cli_env("turns-demo")
+        self.assertEqual(env["HERDR_SESSION"], "turns-demo")
+        self.assertIsNone(env["HERDR_SOCKET_PATH"])
+        self.assertIsNone(env["HERDR_PANE_ID"])
+
+    def test_herdr_run_allows_empty_quiet_success(self) -> None:
+        fake = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(turns.subprocess, "run", return_value=fake):
+            self.assertIsNone(
+                turns.herdr_run("herdr", ["pane", "run", "w1:p1", "true"], allow_empty=True)
+            )
+            with self.assertRaises(RuntimeError):
+                turns.herdr_run("herdr", ["pane", "list"], allow_empty=False)
+
+    def test_nested_launch_command_avoids_parent_session_flag(self) -> None:
+        cmd = turns.nested_herdr_launch_command(
+            "/bin/herdr",
+            session="turns-demo",
+            config_path=Path("/tmp/cfg.toml"),
+        )
+        self.assertIn("HERDR_SESSION=turns-demo", cmd)
+        self.assertIn("HERDR_CONFIG_PATH=/tmp/cfg.toml", cmd)
+        self.assertIn("/bin/herdr", cmd)
+        # Parent `herdr pane run ... --session` would target a missing socket.
+        self.assertNotIn("--session", cmd)
+        # Must be one pane-run COMMAND (not bash -lc word-split).
+        self.assertFalse(cmd.startswith("bash "))
+
+    def test_nested_config_disables_onboarding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = turns.write_nested_config(Path(tmp))
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("onboarding = false", text)
+        self.assertIn("allow_nested = true", text)
+
+    def test_launcher_summary_prompt_includes_report_paths(self) -> None:
+        text = turns.launcher_summary_prompt(
+            summary="# 自己改善レポート\n\nok\n",
+            report_path=Path("/work/自己改善20261015120000.md"),
+            notes_dir=Path("/work/herdr-turns-notes"),
+        )
+        self.assertIn("全ターンサマリー", text)
+        self.assertIn("自己改善20261015120000.md", text)
+        self.assertIn("SUMMARY.md", text)
+        self.assertIn("# 自己改善レポート", text)
+
+    def test_cleanup_nested_pair_stops_session_and_closes_pane(self) -> None:
+        nested = turns.NestedPair(
+            session="turns-demo",
+            outer_pane_id="w2:p9",
+            coder="coder",
+            reviewer="reviewer",
+            planner="coder",
+            config_path=Path("/tmp/cfg.toml"),
+            work_root=Path("/tmp/work"),
+        )
+        calls: list[list[str]] = []
+
+        def fake_herdr_json(_herdr: str, argv: list[str], env=None) -> dict:
+            del env
+            calls.append(list(argv))
+            return {"ok": True}
+
+        with mock.patch.object(turns, "herdr_json", side_effect=fake_herdr_json):
+            turns.cleanup_nested_pair("herdr", nested)
+        self.assertEqual(
+            calls,
+            [
+                ["session", "stop", "turns-demo"],
+                ["session", "delete", "turns-demo"],
+                ["pane", "close", "w2:p9"],
+            ],
+        )
+
+    def test_deliver_summary_to_caller_prompts_launcher_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp)
+            (notes / "launcher-pane").write_text("w2:p1\n", encoding="utf-8")
+            prompted: list[tuple[str, str]] = []
+
+            def fake_resolve(_herdr: str, pane_id: str) -> str:
+                self.assertEqual(pane_id, "w2:p1")
+                return "launcher-agent"
+
+            def fake_prompt_and_wait(
+                herdr: str,
+                target: str,
+                text: str,
+                *,
+                timeout_ms: int,
+                poll_seconds: float = 1.0,
+                env=None,
+            ) -> None:
+                del herdr, poll_seconds, env
+                prompted.append((target, text))
+                self.assertEqual(timeout_ms, 600_000)
+
+            with mock.patch.object(turns, "resolve_agent_in_pane", side_effect=fake_resolve):
+                with mock.patch.object(
+                    turns, "prompt_and_wait", side_effect=fake_prompt_and_wait
+                ):
+                    turns.deliver_summary_to_caller(
+                        "herdr",
+                        "# summary body\n",
+                        report_path=Path("/work/自己改善.md"),
+                        notes_dir=notes,
+                        timeout_ms=600_000,
+                    )
+            self.assertEqual(len(prompted), 1)
+            self.assertEqual(prompted[0][0], "launcher-agent")
+            self.assertIn("# summary body", prompted[0][1])
+
+    def test_persist_and_load_launcher_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp)
+            with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w9:p9", "HERDR_ENV": "1"}):
+                turns.persist_launcher_context(notes)
+            self.assertEqual(
+                (notes / "launcher-pane").read_text(encoding="utf-8").strip(),
+                "w9:p9",
+            )
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(turns.load_launcher_pane(notes), "w9:p9")
 
     def test_from_here_requires_herdr_pane_id(self) -> None:
         env = {k: v for k, v in os.environ.items() if k != "HERDR_PANE_ID"}
@@ -205,14 +350,12 @@ class HerdrAgentTurnsTests(unittest.TestCase):
             self.assertIn("none", summary)
             self.assertIn("APPROVE", summary)
 
-    def test_dry_run_from_here_self_mode(self) -> None:
+    def test_dry_run_from_here_nested_pair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             notes = Path(tmp) / "herdr-turns-notes"
             code = turns.main(
                 [
                     "--from-here",
-                    "--coder",
-                    "me",
                     "--turns",
                     "1",
                     "--goal",

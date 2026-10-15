@@ -4,8 +4,10 @@
 //! - `{session_data_dir}/{session_id}.md` (for example `~/.config/herdr/default.md`)
 //! - `{cwd}/{session_id}.md` (server process current directory)
 //!
-//! Writes are best-effort and never fail the caller.
+//! Instructions come from `agent.prompt` and from TUI typing in agent panes
+//! (buffered until Enter). Writes are best-effort and never fail the caller.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,56 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 const COMPLETION_REPORT_MAX_CHARS: usize = 4_000;
+const DRAFT_MAX_CHARS: usize = 8_000;
+
+/// Per-pane draft buffer for TUI keystrokes until Enter submits them.
+#[derive(Debug, Default)]
+pub struct InstructionDrafts {
+    by_pane: HashMap<String, String>,
+}
+
+impl InstructionDrafts {
+    pub fn append(&mut self, pane_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let draft = self.by_pane.entry(pane_id.to_owned()).or_default();
+        draft.push_str(text);
+        if draft.len() > DRAFT_MAX_CHARS {
+            let keep = draft
+                .char_indices()
+                .rev()
+                .find_map(|(idx, _)| (draft.len() - idx <= DRAFT_MAX_CHARS).then_some(idx))
+                .unwrap_or(0);
+            draft.replace_range(..keep, "");
+        }
+    }
+
+    pub fn backspace(&mut self, pane_id: &str) {
+        let Some(draft) = self.by_pane.get_mut(pane_id) else {
+            return;
+        };
+        draft.pop();
+        if draft.is_empty() {
+            self.by_pane.remove(pane_id);
+        }
+    }
+
+    pub fn clear(&mut self, pane_id: &str) {
+        self.by_pane.remove(pane_id);
+    }
+
+    /// Take the draft when the user submits (Enter). Empty/whitespace-only → None.
+    pub fn take_submitted(&mut self, pane_id: &str) -> Option<String> {
+        let draft = self.by_pane.remove(pane_id)?;
+        let trimmed = draft.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
+}
 
 /// Session id used in the journal filename (`default` when unnamed).
 pub fn session_id() -> String {
@@ -279,5 +331,28 @@ mod tests {
             &a,
             &PathBuf::from("/tmp/herdr-b/default.md")
         ));
+    }
+
+    #[test]
+    fn drafts_submit_on_take_after_append() {
+        let mut drafts = InstructionDrafts::default();
+        drafts.append("w1:p1", "fix ");
+        drafts.append("w1:p1", "the bug");
+        assert_eq!(
+            drafts.take_submitted("w1:p1").as_deref(),
+            Some("fix the bug")
+        );
+        assert!(drafts.take_submitted("w1:p1").is_none());
+    }
+
+    #[test]
+    fn drafts_backspace_and_clear() {
+        let mut drafts = InstructionDrafts::default();
+        drafts.append("p", "ab");
+        drafts.backspace("p");
+        assert_eq!(drafts.take_submitted("p").as_deref(), Some("a"));
+        drafts.append("p", "xy");
+        drafts.clear("p");
+        assert!(drafts.take_submitted("p").is_none());
     }
 }

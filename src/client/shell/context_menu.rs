@@ -90,6 +90,7 @@ impl ClientContextMenuOverlay {
                         },
                         Action::ToggleRightClickPassthrough,
                     ),
+                    item(Msg::CtxStartTurns, Action::StartTurns),
                     item(Msg::CtxClosePane, Action::ClosePane),
                 ]);
                 items
@@ -467,6 +468,10 @@ impl ClientShellState {
                 }),
                 outcome,
             ),
+            ClientContextMenuAction::StartTurns => {
+                self.open_start_turns_overlay(pane_id);
+                outcome.repaint = true;
+            }
             ClientContextMenuAction::ClosePane => self.request_pane_close(pane_id, outcome),
             _ => {}
         }

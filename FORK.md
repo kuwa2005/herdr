@@ -79,8 +79,9 @@ upstream の `release.yml` は `herdrdev/herdr` 専用のまま。この fork �
 export ZIG="$HOME/.local/share/zig-0.16.0/zig"   # 例
 cargo build --release --locked
 install -m 755 target/release/herdr ~/.local/bin/herdr
-# ターン制ランナー（任意）
+# ターン制ランナー（任意; 両方入れる）
 install -m 755 scripts/herdr-turns ~/.local/bin/herdr-turns
+install -m 755 scripts/herdr_agent_turns.py ~/.local/bin/herdr_agent_turns.py
 ```
 
 稼働中サーバーは古いプロセスのままなので、付け直しまたは再起動が必要。
@@ -106,8 +107,10 @@ install -m 755 scripts/herdr-turns ~/.local/bin/herdr-turns
 
 記録内容:
 
-1. **指示** — `herdr agent prompt` で送ったテキスト
+1. **指示** — `herdr agent prompt` のテキスト、およびエージェント認識済みペインでの TUI 入力（Enter 確定時）
 2. **完了** — エージェントが working/blocked → idle になったときの検出バッファ（または直近出力）レポート
+
+サーバを入れ替えたあとは `herdr server stop` のうえ再起動しないと新コードは効きません。
 
 無効化:
 
@@ -137,11 +140,19 @@ Herdr 本体に「A→B 自動パイプ」はない。この fork の公式ワ�
 herdr-turns --from-here --daemon --turns 5 --goal "エラー処理を改善する" --workdir "$PWD"
 ```
 
+既定（`--from-here`）:
+
+1. 隣ペインにネスト Herdr（名前付きセッション `turns-YYYYMMDDHHMMSS`）を起動
+2. その中で `coder` / `reviewer` の 2 エージェントを起動（`--kind`、既定 `cursor`）
+3. ターンをそのペアに対して回す
+
 | フラグ | 意味 |
 | --- | --- |
-| `--from-here` | 現在ペインのエージェントを planner/coder/reviewer に使う |
+| `--from-here` | ネスト Herdr + coder/reviewer を立ち上げて回す |
+| `--self` | 旧挙動: 現在ペインのエージェントだけで自己レビュー |
 | `--daemon` | バックグラウンド起動（前景待ちはデッドロックする） |
-| `--reviewer NAME` | レビュー役を分ける（省略時は自己レビュー） |
+| `--kind` / `--agent-arg` | ネストエージェントの種別と追加引数（既定: `cursor` + `--yolo`） |
+| `--keep-nested` | 終了後もネストセッションを残す（既定は stop/delete + outer pane を閉じる） |
 
 エージェント向け手順: [`.agents/skills/herdr-self-evolve/SKILL.md`](./.agents/skills/herdr-self-evolve/SKILL.md)
 

@@ -123,6 +123,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         server_config_diagnostic: None,
         server_config_diagnostic_without_keybindings: None,
         terminal_attach_owners: HashMap::new(),
+        session_journal_drafts: crate::session_journal::InstructionDrafts::default(),
         pending_alt_screen_reads: Vec::new(),
         deferred_alt_screen_reads: Vec::new(),
         next_activity_stamp: 1,

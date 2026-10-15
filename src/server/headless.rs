@@ -230,6 +230,8 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// TUI keystroke drafts awaiting Enter for the session journal.
+    session_journal_drafts: crate::session_journal::InstructionDrafts,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -380,6 +382,7 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            session_journal_drafts: crate::session_journal::InstructionDrafts::default(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -2452,6 +2455,13 @@ impl HeadlessServer {
                 }
                 if let Err(err) = input_result {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                } else {
+                    self.observe_session_journal_pane_input(
+                        &pane_id,
+                        workspace_index,
+                        runtime_pane_id,
+                        &events,
+                    );
                 }
                 foreground_changed | geometry_changed || scroll_changed
             }

@@ -10,6 +10,116 @@ fn agent_state_label(state: crate::detect::AgentState) -> &'static str {
 }
 
 impl HeadlessServer {
+    fn pane_journal_target(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<String> {
+        let terminal_id = self
+            .app
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .tabs
+            .iter()
+            .find_map(|tab| tab.panes.get(&pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())?;
+        let terminal = self.app.state.terminals.get(&terminal_id)?;
+        if let Some(name) = terminal.agent_name.as_ref().filter(|n| !n.is_empty()) {
+            return Some(name.clone());
+        }
+        terminal
+            .effective_known_agent()
+            .or(terminal.detected_agent)
+            .map(crate::detect::agent_label)
+            .map(str::to_owned)
+    }
+
+    pub(super) fn observe_session_journal_pane_input(
+        &mut self,
+        public_pane_id: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        events: &[crate::protocol::ClientPaneInputEvent],
+    ) {
+        if !self.app.state.session_journal {
+            return;
+        }
+        use crate::protocol::{ClientKeyCode, ClientKeyKind, ClientPaneInputEvent};
+        let control = crossterm::event::KeyModifiers::CONTROL.bits();
+        let alt = crossterm::event::KeyModifiers::ALT.bits();
+        let shift = crossterm::event::KeyModifiers::SHIFT.bits();
+        for event in events {
+            match event {
+                ClientPaneInputEvent::TextCommit(text) | ClientPaneInputEvent::Paste(text) => {
+                    self.session_journal_drafts.append(public_pane_id, text);
+                }
+                ClientPaneInputEvent::Key {
+                    code,
+                    modifiers,
+                    kind,
+                    generated_text,
+                    ..
+                } => {
+                    if !matches!(kind, ClientKeyKind::Press | ClientKeyKind::Repeat) {
+                        continue;
+                    }
+                    let mods = *modifiers;
+                    if mods & control != 0 {
+                        if matches!(code, ClientKeyCode::Char('c' | 'C' | 'u' | 'U')) {
+                            self.session_journal_drafts.clear(public_pane_id);
+                        }
+                        continue;
+                    }
+                    if mods & alt != 0 {
+                        continue;
+                    }
+                    match code {
+                        ClientKeyCode::Enter => {
+                            let Some(text) =
+                                self.session_journal_drafts.take_submitted(public_pane_id)
+                            else {
+                                continue;
+                            };
+                            let Some(target) = self.pane_journal_target(ws_idx, pane_id) else {
+                                continue;
+                            };
+                            crate::session_journal::record_instruction(
+                                true,
+                                &target,
+                                Some(public_pane_id),
+                                &text,
+                            );
+                        }
+                        ClientKeyCode::Backspace => {
+                            self.session_journal_drafts.backspace(public_pane_id);
+                        }
+                        ClientKeyCode::Esc => {
+                            self.session_journal_drafts.clear(public_pane_id);
+                        }
+                        ClientKeyCode::Char(ch) if mods == 0 || mods == shift => {
+                            if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty()) {
+                                self.session_journal_drafts.append(public_pane_id, text);
+                            } else {
+                                let mut buf = [0u8; 4];
+                                self.session_journal_drafts
+                                    .append(public_pane_id, ch.encode_utf8(&mut buf));
+                            }
+                        }
+                        _ => {
+                            if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty()) {
+                                if mods == 0 || mods == shift {
+                                    self.session_journal_drafts.append(public_pane_id, text);
+                                }
+                            }
+                        }
+                    }
+                }
+                ClientPaneInputEvent::Mouse { .. } => {}
+            }
+        }
+    }
+
     fn record_session_journal_completion(
         &self,
         ws_idx: usize,

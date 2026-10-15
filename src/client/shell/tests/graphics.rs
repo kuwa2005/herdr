@@ -299,6 +299,15 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
             removing: false,
             force_confirmation: false,
         }),
+        ClientShellOverlay::StartTurns(ClientStartTurnsOverlay {
+            pane_id: "pane_1".into(),
+            workdir: "/repo".into(),
+            goal: TextEditor::default(),
+            turns: TextEditor::new("5", true),
+            focused: ClientStartTurnsField::Goal,
+            error: None,
+            starting: false,
+        }),
         ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
             target: ClientContextMenuTarget::Tab {
                 tab_id: "tab_1".into(),
