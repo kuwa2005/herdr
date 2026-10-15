@@ -135,16 +135,19 @@ python3 scripts/summarize_herdr_tabs.py --format markdown
 
 ユニットテスト: `python3 -m unittest scripts.test_summarize_herdr_tabs`（`just maintenance-test` にも登録）。
 
-### ターン制エージェント改善（`herdr_agent_turns`）
+### ターン制エージェント自己進化（`herdr_agent_turns`）
 
-coder / reviewer の **実装 → レビュー → 適用** を N ターン回し、最後に `SUMMARY.md` を書きます（この fork の公式ワークフロー）。
+**自己指示 → 自己修正 → 自己レビュー →（必要なら適用）→ 次の自己指示** を最大 10 ターン回します。`--turns` は 1〜10（既定 10）。終了時は効果判定レポート `自己改善yyyymmddhhmmss.md` を画面表示＋ファイル出力します。
 
 ```bash
-just agent-turns --coder coder --reviewer reviewer --turns 3 \
+herdr-turns --from-here --daemon --turns 5 --goal "..." --workdir "$PWD"
+
+just agent-turns --coder coder --reviewer reviewer --turns 10 \
   --goal "..." --notes-dir /var/tmp/herdr-turns-notes --workdir "$PWD"
 ```
 
-詳細はリポジトリルートの [`FORK.md`](../../FORK.md#マルチエージェント自動化) を参照してください。
+詳細は [`FORK.md`](../../FORK.md#マルチエージェント自動化自己進化) と [`.agents/skills/herdr-self-evolve/SKILL.md`](../../.agents/skills/herdr-self-evolve/SKILL.md) を参照してください。
+
 ## ドキュメント
 
 公開ドキュメントは [herdr.dev/ja/docs](https://herdr.dev/ja/docs/) を参照してください。  

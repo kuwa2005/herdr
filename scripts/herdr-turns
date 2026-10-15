@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# PATH-friendly launcher for herdr_agent_turns.py (same directory).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$ROOT/herdr_agent_turns.py" "$@"

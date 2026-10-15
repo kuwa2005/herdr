@@ -72,6 +72,19 @@ git merge upstream/master   # または rebase。方針に合わせて選択
 
 upstream の `release.yml` は `herdrdev/herdr` 専用のまま。この fork では使わない。
 
+## ローカルインストール（ソース）
+
+```bash
+# Zig 0.16.0 と rust-toolchain.toml の Rust が必要
+export ZIG="$HOME/.local/share/zig-0.16.0/zig"   # 例
+cargo build --release --locked
+install -m 755 target/release/herdr ~/.local/bin/herdr
+# ターン制ランナー（任意）
+install -m 755 scripts/herdr-turns ~/.local/bin/herdr-turns
+```
+
+稼働中サーバーは古いプロセスのままなので、付け直しまたは再起動が必要。
+
 ## エージェント向け
 
 1. まず [`AGENTS.md`](./AGENTS.md) とこのファイルを読む。
@@ -79,13 +92,50 @@ upstream の `release.yml` は `herdrdev/herdr` 専用のまま。この fork �
 3. `herdrdev/herdr` への実装 PR・機能 Issue は開かない（CONTRIBUTING / AGENTS の外部貢献ガードを維持）。
 4. upstream 由来の再現バグを本家に報告する場合だけ、人間が CONTRIBUTING のバグテンプレート手順に従う。
 
-## マルチエージェント自動化
+## マルチエージェント自動化（自己進化）
 
-Herdr 自体に「A の出力を B へ自動パイプする」機能はない。代わりに **ターン制ループ**（実装 → レビュー → 適用）を公式ワークフローとして使う。全ターン終了後に `SUMMARY.md` を出す。
+Herdr 本体に「A→B 自動パイプ」はない。この fork の公式ワークフローは **最大 10 ターンの自己進化ループ**。
 
-### `herdr_agent_turns`（公式）
+### 1 ターンの流れ
 
-あらかじめ `coder` / `reviewer` を起動してから:
+1. **INSTRUCT** — `TURN{n}_PLAN.md`（`STATUS` / `TASK` / `DONE_WHEN`）
+2. **FIX** — `TURN{n}_RESULT.md`（`DONE` / `VERIFIED` / `FILES`）
+3. **REVIEW** — `TURN{n}_REVIEW.md`（`VERDICT` / `IMPROVE` / `EFFECT`）
+4. **APPLY** — `VERDICT: REVISE` のときだけ
+5. 次ターンの INSTRUCT が直前レビューを読み、さらなる指示を出す
+
+制約: `--turns` は **1〜10**（既定 10）。`VERDICT: DONE` または `STATUS: DONE` で早期終了。
+
+### 想定 UX: 「ここから N ターン自己改善して」
+
+```bash
+# Herdr 管理ペイン内（$HERDR_ENV=1 / $HERDR_PANE_ID）
+herdr-turns --from-here --daemon --turns 5 --goal "エラー処理を改善する" --workdir "$PWD"
+```
+
+| フラグ | 意味 |
+| --- | --- |
+| `--from-here` | 現在ペインのエージェントを planner/coder/reviewer に使う |
+| `--daemon` | バックグラウンド起動（前景待ちはデッドロックする） |
+| `--reviewer NAME` | レビュー役を分ける（省略時は自己レビュー） |
+
+エージェント向け手順: [`.agents/skills/herdr-self-evolve/SKILL.md`](./.agents/skills/herdr-self-evolve/SKILL.md)
+
+### 終了時の効果判定レポート
+
+画面表示に加え、作業ディレクトリへ:
+
+- **`自己改善yyyymmddhhmmss.md`**
+- `notes-dir/SUMMARY.md`（同内容）
+
+レポート構成:
+
+1. **大元の指示**（`--goal`）
+2. **効果判定**（DONE/APPROVE/REVISE から自動ラベル）
+3. **ターン一覧**（指示 / できたこと / レビュー改善 / VERDICT / 効果）
+4. **各ターン詳細**（PLAN / RESULT / REVIEW 全文）
+
+### 役割を分けて回す例
 
 ```bash
 herdr agent start coder --kind cursor --pane <pane> -- --trust -f --model composer-2.5
@@ -94,33 +144,21 @@ herdr agent start reviewer --kind cursor --pane <pane> -- --trust -f --model com
 just agent-turns \
   --coder coder \
   --reviewer reviewer \
-  --turns 3 \
+  --turns 10 \
   --goal "Improve multi-agent orchestration helpers" \
   --notes-dir /var/tmp/herdr-turns-notes \
   --workdir "$PWD"
-# または: python3 scripts/herdr_agent_turns.py ...
-```
-
-各ターンで `TURN{n}_RESULT.md` / `TURN{n}_REVIEW.md` を書き、最後に `SUMMARY.md`（ターンごとの実装・レビュー指示・適用結果）を出力する。`--dry-run` でプロンプト計画だけ確認できる。
-
-手動で同等のことをする場合:
-
-```bash
-herdr agent prompt coder "..."   # 必要なら focus / esc のあと
-herdr agent focus coder
-herdr agent prompt reviewer "..."
-herdr agent prompt coder "Apply REVIEW.md ..."
 ```
 
 補足:
 
-- 対象名は `herdr agent rename` / `agent start <name>` の名前。一覧は `python3 scripts/summarize_herdr_tabs.py` の **target** 列でも確認できる。
-- `agent prompt --wait` が `agent_prompt_stalled` になるときは、UI を `esc` で戻すか、`--wait` なしで送ってから状態ポーリングする（`herdr_agent_turns` は後者）。
-- 既定セッションを汚さない再現・実験は名前付きセッション（`herdr --session ...`）を使う。
+- 対象名は `herdr agent rename` / `agent start <name>`。一覧は `python3 scripts/summarize_herdr_tabs.py` の **target** 列。
+- `agent prompt --wait` が `agent_prompt_stalled` になるときは `--wait` なし＋状態ポーリング（本スクリプトは後者）。
+- 実験は名前付きセッション（`herdr --session ...`）を推奨。
 
-### 自己改善ループ（記録: 3 ターン）
+### 自己改善ループ（記録: 初期 3 ターン）
 
-Cursor Agent（`composer-2.5`）の coder / reviewer で、この fork の要約スクリプトを 3 ターン改善した。
+Cursor Agent（`composer-2.5`）の coder / reviewer で、この fork の要約スクリプトを 3 ターン改善した（当時の実装→レビュー→適用フロー）。
 
 | ターン | 実装 | レビュー指摘 | 適用 |
 | --- | --- | --- | --- |
@@ -128,4 +166,4 @@ Cursor Agent（`composer-2.5`）の coder / reviewer で、この fork の要約
 | 2 | `scripts/fixtures/agent-list-v092.json` と fixture テスト | Turn 2 は合格。Turn 3 向け: A=`herdr_json` error テスト、B=`justfile` に unittest 登録 | B と markdown `` `name` (`pane_id`) `` 表示など |
 | 3 | `test_herdr_json_raises_on_error_payload` ほか fallback / load-fixture テスト（計 10） | ブロッキング指摘なし。コミット時は fixture を含める | テスト緑を確認して完了 |
 
-関連ファイル: `scripts/summarize_herdr_tabs.py`、`scripts/test_summarize_herdr_tabs.py`、`scripts/fixtures/agent-list-v092.json`、`justfile`（`maintenance-test`）。
+関連: `scripts/summarize_herdr_tabs.py`、`scripts/herdr_agent_turns.py`、`scripts/herdr-turns`、`justfile`（`agent-turns` / `maintenance-test`）。

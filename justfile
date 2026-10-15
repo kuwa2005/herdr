@@ -265,6 +265,6 @@ default-config:
 tabs-summary *args:
     {{python}} scripts/summarize_herdr_tabs.py {{args}}
 
-# Run coder/reviewer improvement turns, then write SUMMARY.md
+# Self-evolve turns (instruct→fix→review). Example: just agent-turns --from-here --daemon --turns 5 --goal "..."
 agent-turns *args:
     {{python}} scripts/herdr_agent_turns.py {{args}}
