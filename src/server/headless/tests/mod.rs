@@ -3857,6 +3857,50 @@ fn install_focused_test_runtime(
     input_rx
 }
 
+#[test]
+fn session_journal_text_commit_cr_flushes_instruction_draft() {
+    // Kitty report-all often delivers Enter as TextCommit("\r"), not Key(Enter).
+    let mut server = test_headless_server();
+    server.app.state.session_journal = true;
+    let workspace = crate::workspace::Workspace::test_new("journal-cr");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).cloned().expect("terminal");
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.ensure_test_terminals();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .expect("terminal state")
+        .set_agent_name("cursor".into());
+    let public = server
+        .app
+        .public_pane_id(0, pane_id)
+        .expect("public pane id");
+
+    server.observe_session_journal_pane_input(
+        &public,
+        0,
+        pane_id,
+        &[protocol::ClientPaneInputEvent::TextCommit("investigate".into())],
+    );
+    server.observe_session_journal_pane_input(
+        &public,
+        0,
+        pane_id,
+        &[protocol::ClientPaneInputEvent::TextCommit("\r".into())],
+    );
+    assert!(
+        server
+            .session_journal_drafts
+            .take_submitted(&public)
+            .is_none(),
+        "bare CR TextCommit must flush the draft like Enter"
+    );
+}
+
 fn retained_test_server(
     initial_screen: &[u8],
 ) -> (

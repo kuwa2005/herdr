@@ -35,6 +35,24 @@ impl HeadlessServer {
             .map(str::to_owned)
     }
 
+    fn record_session_journal_instruction(
+        &self,
+        public_pane_id: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        text: &str,
+    ) {
+        let Some(target) = self.pane_journal_target(ws_idx, pane_id) else {
+            return;
+        };
+        crate::session_journal::record_instruction(
+            true,
+            &target,
+            Some(public_pane_id),
+            text,
+        );
+    }
+
     pub(super) fn observe_session_journal_pane_input(
         &mut self,
         public_pane_id: &str,
@@ -51,8 +69,20 @@ impl HeadlessServer {
         let shift = crossterm::event::KeyModifiers::SHIFT.bits();
         for event in events {
             match event {
+                // Kitty (and some IME hosts) report Enter as TextCommit("\r")
+                // instead of Key(Enter). Treat embedded newlines as submit.
                 ClientPaneInputEvent::TextCommit(text) | ClientPaneInputEvent::Paste(text) => {
-                    self.session_journal_drafts.append(public_pane_id, text);
+                    for submitted in self
+                        .session_journal_drafts
+                        .push_committed(public_pane_id, text)
+                    {
+                        self.record_session_journal_instruction(
+                            public_pane_id,
+                            ws_idx,
+                            pane_id,
+                            &submitted,
+                        );
+                    }
                 }
                 ClientPaneInputEvent::Key {
                     code,
@@ -81,13 +111,10 @@ impl HeadlessServer {
                             else {
                                 continue;
                             };
-                            let Some(target) = self.pane_journal_target(ws_idx, pane_id) else {
-                                continue;
-                            };
-                            crate::session_journal::record_instruction(
-                                true,
-                                &target,
-                                Some(public_pane_id),
+                            self.record_session_journal_instruction(
+                                public_pane_id,
+                                ws_idx,
+                                pane_id,
                                 &text,
                             );
                         }
@@ -99,7 +126,17 @@ impl HeadlessServer {
                         }
                         ClientKeyCode::Char(ch) if mods == 0 || mods == shift => {
                             if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty()) {
-                                self.session_journal_drafts.append(public_pane_id, text);
+                                for submitted in self
+                                    .session_journal_drafts
+                                    .push_committed(public_pane_id, text)
+                                {
+                                    self.record_session_journal_instruction(
+                                        public_pane_id,
+                                        ws_idx,
+                                        pane_id,
+                                        &submitted,
+                                    );
+                                }
                             } else {
                                 let mut buf = [0u8; 4];
                                 self.session_journal_drafts
@@ -109,7 +146,17 @@ impl HeadlessServer {
                         _ => {
                             if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty()) {
                                 if mods == 0 || mods == shift {
-                                    self.session_journal_drafts.append(public_pane_id, text);
+                                    for submitted in self
+                                        .session_journal_drafts
+                                        .push_committed(public_pane_id, text)
+                                    {
+                                        self.record_session_journal_instruction(
+                                            public_pane_id,
+                                            ws_idx,
+                                            pane_id,
+                                            &submitted,
+                                        );
+                                    }
                                 }
                             }
                         }

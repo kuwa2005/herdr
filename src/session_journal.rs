@@ -68,6 +68,48 @@ impl InstructionDrafts {
             Some(trimmed.to_owned())
         }
     }
+
+    /// Append host-committed text (IME / paste / Kitty text reports).
+    ///
+    /// Any `\n` or `\r` (including a bare Enter reported as `"\r"`) acts like
+    /// Enter and yields zero or more submitted instruction strings.
+    pub fn push_committed(&mut self, pane_id: &str, text: &str) -> Vec<String> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut submitted = Vec::new();
+        let bytes = text.as_bytes();
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' => {
+                    self.append(pane_id, &text[start..i]);
+                    if let Some(value) = self.take_submitted(pane_id) {
+                        submitted.push(value);
+                    }
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                    start = i;
+                }
+                b'\n' => {
+                    self.append(pane_id, &text[start..i]);
+                    if let Some(value) = self.take_submitted(pane_id) {
+                        submitted.push(value);
+                    }
+                    i += 1;
+                    start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        if start < text.len() {
+            self.append(pane_id, &text[start..]);
+        }
+        submitted
+    }
 }
 
 /// Session id recorded in the journal header (`default` when unnamed).
@@ -354,5 +396,27 @@ mod tests {
         drafts.append("p", "xy");
         drafts.clear("p");
         assert!(drafts.take_submitted("p").is_none());
+    }
+
+    #[test]
+    fn push_committed_treats_bare_cr_as_enter() {
+        let mut drafts = InstructionDrafts::default();
+        drafts.append("p", "hello");
+        // Kitty report-all often sends Enter as TextCommit("\r").
+        assert_eq!(
+            drafts.push_committed("p", "\r"),
+            vec!["hello".to_owned()]
+        );
+        assert!(drafts.take_submitted("p").is_none());
+    }
+
+    #[test]
+    fn push_committed_splits_embedded_newlines() {
+        let mut drafts = InstructionDrafts::default();
+        assert_eq!(
+            drafts.push_committed("p", "first\nsecond\r\nthird"),
+            vec!["first".to_owned(), "second".to_owned()]
+        );
+        assert_eq!(drafts.take_submitted("p").as_deref(), Some("third"));
     }
 }
