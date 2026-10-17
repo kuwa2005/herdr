@@ -125,13 +125,19 @@ Herdr 本体に「A→B 自動パイプ」はない。この fork の公式ワ�
 
 ### 1 ターンの流れ
 
-1. **INSTRUCT**（director）— `TURN{n}_PLAN.md`（`STATUS` / `TASK` / `DONE_WHEN`）
+1. **INSTRUCT**（director）— `TURN{n}_PLAN.md`（`STATUS` / `TASK` / `DONE_WHEN`）。`STATUS: DONE|STOP|ESCALATE` 可
 2. **FIX**（coder）— `TURN{n}_RESULT.md`（`DONE` / `VERIFIED` / `FILES`）
-3. **REVIEW**（reviewer）— `TURN{n}_REVIEW.md`（`VERDICT` / `IMPROVE` / `EFFECT`）
+3. **REVIEW**（reviewer）— `TURN{n}_REVIEW.md`（`VERDICT` / `IMPROVE` / `EFFECT`）。`VERDICT: APPROVE|REVISE|DONE|STOP|ESCALATE`
 4. **APPLY**（coder）— `VERDICT: REVISE` のときだけ
 5. 次ターンの INSTRUCT が直前レビューを読み、さらなる指示を出す
 
-制約: `--turns` は **1〜10**（既定 10）。`VERDICT: DONE` または `STATUS: DONE` で早期終了。
+制約: `--turns` は **1〜10**（既定 10）。早期終了は `VERDICT: DONE|STOP|ESCALATE`、または planner の `STATUS: DONE|STOP|ESCALATE`。
+
+**COMPLETE.md vs NEEDS_OWNER.md:** 成功終了（`VERDICT: DONE` / planner `STATUS: DONE`、または goal 達成を明示した `STOP`）では `notes-dir/COMPLETE.md` を書く（owner はまずこれを読む）。`ESCALATE`・stall（同じ TASK）・ターン上限のみでは **書かず**、判断待ちは従来どおり `NEEDS_OWNER.md`（goal / turn / why / resume 手順）。両者は排他。
+
+**Missing VERDICT:** レビューに `VERDICT:` 行が無いとき、オーナー判断を示す文言（例: needs owner / human judgment / `STATUS: Needs decision`）があれば **ESCALATE** 扱い。それ以外の中立文は従来どおり **APPROVE**（`resolve_review_verdict`）。
+
+**検証期待:** FIX の `VERIFIED` は具体コマンド必須（曖昧な「looks good」等は禁止。コード変更時は RESULT 前に該当テストを実行）。REVIEW は `DONE_WHEN` 未達や弱い/欠落 `VERIFIED` なら **REVISE** を優先。
 
 ### 想定 UX: 「ここから N ターン自己改善して」
 
@@ -151,10 +157,88 @@ herdr-turns --from-here --daemon --turns 5 --goal "エラー処理を改善す�
 | `--from-here` | ネスト Herdr + 2x2 director/coder/reviewer を立ち上げて回す |
 | `--self` | 旧挙動: 現在ペインのエージェントだけで自己レビュー |
 | `--daemon` | バックグラウンド起動（前景待ちはデッドロックする） |
-| `--kind` / `--agent-arg` | ネストエージェントの種別と追加引数（既定: `cursor` + `--yolo`） |
+| `--kind` / `--agent-arg` | ネストエージェントの種別と共有追加引数（既定: `cursor` + `--yolo`） |
+| `--planner-arg` / `--coder-arg` / `--reviewer-arg` | ロール専用 argv（非空なら `--agent-arg` を**置き換え**。`-` 始まりは `--coder-arg=--yolo` 形式） |
+| `--goal-file` / `--acceptance-file` / `--task-pack` | goal / 受け入れ基準をファイルから読む（CLI `--goal` が最優先） |
+| `--test-command` | FIX 後に実行し、exit / 出力を `TURN{n}_STATE.txt` と REVIEW に添付 |
+| `--constraints` / `--no-default-constraints` | 制約ファイル上書き / バンドル default 言及をオフ |
+| `--notify-webhook` | 終端で JSON POST（環境変数 `HERDR_TURNS_WEBHOOK` 可。CLI 優先） |
 | `--keep-nested` | 終了後もネストセッションを残す（既定は stop/delete + outer pane を閉じる） |
+| `--resume` | 既存 `--notes-dir` から中断/ESCALATE 後に再開（`--notes-dir` 必須） |
+| `--owner-reply` | resume 時のみ。オーナー補足を先頭ターンの INSTRUCT/FIX に一度だけ注入（`OWNER_REPLY.md` より優先） |
 
 エージェント向け手順: [`.agents/skills/herdr-self-evolve/SKILL.md`](./.agents/skills/herdr-self-evolve/SKILL.md)
+
+### ESCALATE と再開
+
+人間の判断が必要なとき、reviewer は `VERDICT: ESCALATE`、planner は `STATUS: ESCALATE` でループを止め、`NEEDS_OWNER.md` を残す。
+
+再開:
+
+- `--resume --notes-dir <dir>` が必須。`--goal` は省略可（優先順: CLI → `notes-dir/run.json` → `NEEDS_OWNER.md` の `## Goal`）
+- `--turns` は **再開後の開始ターンから** の上限（例: start=3, `--turns 2` → ターン 3–4）。絶対番号は `MAX_TURNS`（10）でクランプ
+- 通常開始時に `run.json`（goal / workdir / max_turns など）を書く。resume 開始時は既存 `NEEDS_OWNER.md` を `NEEDS_OWNER.prev.md` へ退避
+- 開始ターン: 完了済み（非スケルトン）`TURN{n}_REVIEW` の次。未完了ターン（PLAN/RESULT あり・REVIEW なし、planner ESCALATE 含む）は **同じ n を再実行**
+
+```bash
+herdr-turns --from-here --daemon --resume --notes-dir ./herdr-turns-notes --turns 3 --workdir "$PWD"
+# オーナー補足を渡す例（CLI が notes-dir/OWNER_REPLY.md より優先）
+herdr-turns --from-here --daemon --resume --notes-dir ./herdr-turns-notes --turns 3 \
+  --workdir "$PWD" --owner-reply "Approach B; skip A"
+```
+
+### Wave 2 オーケストレータ hardening
+
+無人ループ向けのランナー側ガード（プロンプト文言だけに頼らない）:
+
+- **Owner reply on resume** — `notes-dir/OWNER_REPLY.md` を書くか `--owner-reply "..."` を渡す（CLI 優先。空/空白は無視）。再開セッションの **先頭ターン** の INSTRUCT+FIX に一度だけ注入。消費は `run.json` の `owner_reply_sha256` と、ファイルがある場合の `OWNER_REPLY.consumed.md` リネーム。同じ内容の再 resume では再注入しない
+- **Weak VERIFIED soft-gate** — FIX 後、RESULT の `VERIFIED` が欠落/スケルトン/曖昧なら coder へ **最大1回** 再プロンプト。なお弱い場合は REVIEW 先頭に prefer-REVISE の orchestrator note を付ける（その後 REVIEW へ進む）
+- **Stall detection** — 継続 PLAN の `TASK` が前ターンと正規化一致（strip / 小文字 / 空白畳み / 末尾句読点除去）なら FIX 前に停止し `NEEDS_OWNER.md` を書く（繰り返しタスクの説明付き）
+- **REVIEW diff context** — Wave 2 時点では `git diff --stat` / `--name-status` のみ。Wave 3 では **state pack**（下記）に統合
+
+### AI駆動・自己進化（wave 3）
+
+cursor-dual-agent-loop の *ideas* を `herdr-turns` に移植した層。**`auto/orchestrator/dual_agent_loop.py` は埋め込まず・呼び出さない**（別ツールのまま）。
+
+| dual-agent-loop idea | herdr-turns |
+| --- | --- |
+| Master は prose より成果物を見る | FIX 後に `collect_turn_review_pack` → `notes-dir/TURN{n}_STATE.txt`。REVIEW に pack 本文 + ファイルパスを注入（`--test-command` 任意） |
+| `COMPLETE.md` on STOP | 成功終了で `COMPLETE.md`（ルールは上記 [COMPLETE.md vs NEEDS_OWNER.md](#マルチエージェント自動化自己進化)） |
+| Task = instructions + acceptance | `--goal-file` / `--acceptance-file` / `--task-pack`（YAML `goal:`/`acceptance:` または Markdown `## Goal` / `## Acceptance`）。パスと内容 hash を `run.json` に保存 |
+| Review に test 結果 | `--test-command "..."`（stdout/stderr + exit。resume 復元可） |
+| Cheap coder / strong master | `--coder-arg=--yolo` など安価側、`--reviewer-arg=--model --reviewer-arg composer-2.5` など強め reviewer。未指定ロールは `--agent-arg` → 既定 `--yolo` |
+| Write boundaries | バンドル [`scripts/herdr_turns_constraints.default.md`](./scripts/herdr_turns_constraints.default.md) を **always-on mention**（`--constraints` で上書き、`--no-default-constraints` でオフ） |
+| Headless overnight | 下記 tmux / daemon レシピ + 任意 `--notify-webhook` / `HERDR_TURNS_WEBHOOK` |
+
+**コスト分割の例:**
+
+```bash
+herdr-turns --from-here --daemon --turns 5 \
+  --goal-file ./task-goal.md --acceptance-file ./acceptance.md \
+  --test-command "python3 -m unittest scripts.test_herdr_agent_turns -q" \
+  --coder-arg=--yolo \
+  --reviewer-arg=--model --reviewer-arg composer-2.5 \
+  --workdir "$PWD"
+```
+
+**Headless / overnight（server + tmux）:**
+
+```bash
+# 例: 長時間セッションを tmux に載せる
+tmux new -s herdr-turns
+# Herdr TUI / 管理ペイン内で:
+herdr-turns --from-here --daemon --turns 8 \
+  --task-pack ./task.yaml \
+  --test-command "python3 -m unittest scripts.test_herdr_agent_turns -q" \
+  --notify-webhook "https://example.invalid/hooks/herdr-turns" \
+  --workdir "$PWD"
+# detach して翌朝確認:
+#   notes-dir/COMPLETE.md … 成功
+#   notes-dir/NEEDS_OWNER.md … 判断待ち / stall
+#   webhook JSON event: complete | escalate | stop
+```
+
+Webhook ペイロード概要: `event`, `goal`, `turn`, `verdict`, `stop_reason`, `notes_dir`, `workdir`。失敗は `warning:` のみ（ループは落とさない）。
 
 ### 終了時の効果判定レポート
 
@@ -166,7 +250,7 @@ herdr-turns --from-here --daemon --turns 5 --goal "エラー処理を改善す�
 レポート構成:
 
 1. **大元の指示**（`--goal`）
-2. **効果判定**（DONE/APPROVE/REVISE から自動ラベル）
+2. **効果判定**（DONE/APPROVE/REVISE/ESCALATE から自動ラベル。ESCALATE 時は「オーナー判断待ち」）
 3. **ターン一覧**（指示 / できたこと / レビュー改善 / VERDICT / 効果）
 4. **各ターン詳細**（PLAN / RESULT / REVIEW 全文）
 

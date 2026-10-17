@@ -139,7 +139,7 @@ python3 scripts/summarize_herdr_tabs.py --format markdown
 
 **自己指示 → 自己修正 → 自己レビュー →（必要なら適用）→ 次の自己指示** を最大 10 ターン回します。`--turns` は 1〜10（既定 10）。
 
-終了時は画面表示に加え、効果判定レポート `自己改善yyyymmddhhmmss.md`（大元の指示 / 各ターンでできたこと / レビュー改善 / 自動判定）を書きます。
+終了時は画面表示に加え、効果判定レポート `自己改善yyyymmddhhmmss.md`（大元の指示 / 各ターンでできたこと / レビュー改善 / 自動判定）を書きます。成功終了では `notes-dir/COMPLETE.md`、判断待ちでは `NEEDS_OWNER.md` が残ります。Wave 3 では task ファイル（`--goal-file` / `--task-pack`）、REVIEW 用 state pack、任意の overnight webhook（`--notify-webhook`）も使えます。同じ `--notes-dir` に `--resume` を付けて続きから再開できます。
 
 ```bash
 # いまのエージェントペインから（デッドロック回避のため --daemon）
@@ -148,9 +148,12 @@ herdr-turns --from-here --daemon --turns 5 --goal "..." --workdir "$PWD"
 # 役割を分ける場合
 just agent-turns --coder coder --reviewer reviewer --turns 10 \
   --goal "..." --notes-dir /var/tmp/herdr-turns-notes --workdir "$PWD"
+
+# ESCALATE / 中断後の再開例
+herdr-turns --from-here --daemon --resume --notes-dir ./herdr-turns-notes --turns 3 --workdir "$PWD"
 ```
 
-詳細は [`FORK.md`](./FORK.md#マルチエージェント自動化自己進化) と [`.agents/skills/herdr-self-evolve/SKILL.md`](./.agents/skills/herdr-self-evolve/SKILL.md) を参照してください。
+詳細は [`FORK.md` の AI駆動・自己進化（wave 3）](./FORK.md#ai駆動自己進化wave-3)（[マルチエージェント自動化](./FORK.md#マルチエージェント自動化自己進化) 全体）と [`.agents/skills/herdr-self-evolve/SKILL.md`](./.agents/skills/herdr-self-evolve/SKILL.md) を参照してください。
 
 ## ドキュメント
 
