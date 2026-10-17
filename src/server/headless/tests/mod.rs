@@ -3884,7 +3884,9 @@ fn session_journal_text_commit_cr_flushes_instruction_draft() {
         &public,
         0,
         pane_id,
-        &[protocol::ClientPaneInputEvent::TextCommit("investigate".into())],
+        &[protocol::ClientPaneInputEvent::TextCommit(
+            "investigate".into(),
+        )],
     );
     server.observe_session_journal_pane_input(
         &public,

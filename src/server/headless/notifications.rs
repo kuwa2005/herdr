@@ -10,11 +10,7 @@ fn agent_state_label(state: crate::detect::AgentState) -> &'static str {
 }
 
 impl HeadlessServer {
-    fn pane_journal_target(
-        &self,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-    ) -> Option<String> {
+    fn pane_journal_target(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<String> {
         let terminal_id = self
             .app
             .state
@@ -45,12 +41,7 @@ impl HeadlessServer {
         let Some(target) = self.pane_journal_target(ws_idx, pane_id) else {
             return;
         };
-        crate::session_journal::record_instruction(
-            true,
-            &target,
-            Some(public_pane_id),
-            text,
-        );
+        crate::session_journal::record_instruction(true, &target, Some(public_pane_id), text);
     }
 
     pub(super) fn observe_session_journal_pane_input(
@@ -125,7 +116,8 @@ impl HeadlessServer {
                             self.session_journal_drafts.clear(public_pane_id);
                         }
                         ClientKeyCode::Char(ch) if mods == 0 || mods == shift => {
-                            if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty()) {
+                            if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty())
+                            {
                                 for submitted in self
                                     .session_journal_drafts
                                     .push_committed(public_pane_id, text)
@@ -144,7 +136,8 @@ impl HeadlessServer {
                             }
                         }
                         _ => {
-                            if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty()) {
+                            if let Some(text) = generated_text.as_deref().filter(|t| !t.is_empty())
+                            {
                                 if mods == 0 || mods == shift {
                                     for submitted in self
                                         .session_journal_drafts

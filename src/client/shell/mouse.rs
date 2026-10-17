@@ -1476,9 +1476,10 @@ impl ClientShellState {
                                         ClientWorktreeOpenOverlay { opening: true, .. }
                                     ) | ClientShellOverlay::WorktreeRemove(
                                         ClientWorktreeRemoveOverlay { removing: true, .. }
-                                    ) | ClientShellOverlay::StartTurns(
-                                        ClientStartTurnsOverlay { starting: true, .. }
-                                    )
+                                    ) | ClientShellOverlay::StartTurns(ClientStartTurnsOverlay {
+                                        starting: true,
+                                        ..
+                                    })
                                 )
                             );
                         if !busy {

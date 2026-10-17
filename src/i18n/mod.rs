@@ -271,7 +271,6 @@ mod tests {
         }
         assert_eq!(t(UiLanguage::Ja, Msg::CtxStartTurns), "ターン制を開始...");
         assert_eq!(t(UiLanguage::ZhCn, Msg::CtxStartTurns), "开始回合循环...");
-
     }
 
     #[test]

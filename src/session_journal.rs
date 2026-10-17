@@ -369,10 +369,7 @@ mod tests {
     fn paths_equal_matches_identical_paths() {
         let a = PathBuf::from("/tmp/herdr-a/herdrlog.md");
         assert!(paths_equal(&a, &a));
-        assert!(!paths_equal(
-            &a,
-            &PathBuf::from("/tmp/herdr-b/herdrlog.md")
-        ));
+        assert!(!paths_equal(&a, &PathBuf::from("/tmp/herdr-b/herdrlog.md")));
     }
 
     #[test]
@@ -403,10 +400,7 @@ mod tests {
         let mut drafts = InstructionDrafts::default();
         drafts.append("p", "hello");
         // Kitty report-all often sends Enter as TextCommit("\r").
-        assert_eq!(
-            drafts.push_committed("p", "\r"),
-            vec!["hello".to_owned()]
-        );
+        assert_eq!(drafts.push_committed("p", "\r"), vec!["hello".to_owned()]);
         assert!(drafts.take_submitted("p").is_none());
     }
 

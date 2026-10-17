@@ -21,17 +21,13 @@ pub(super) fn validate_start_turns_form(goal: &str, turns: &str) -> Result<(Stri
     }
     let turns = turns.trim();
     if turns.is_empty() {
-        return Err(format!(
-            "turns must be {START_TURNS_MIN}-{START_TURNS_MAX}"
-        ));
+        return Err(format!("turns must be {START_TURNS_MIN}-{START_TURNS_MAX}"));
     }
     let parsed: u32 = turns
         .parse()
         .map_err(|_| format!("turns must be {START_TURNS_MIN}-{START_TURNS_MAX}"))?;
     if !(START_TURNS_MIN..=START_TURNS_MAX).contains(&parsed) {
-        return Err(format!(
-            "turns must be {START_TURNS_MIN}-{START_TURNS_MAX}"
-        ));
+        return Err(format!("turns must be {START_TURNS_MIN}-{START_TURNS_MAX}"));
     }
     Ok((goal.to_owned(), parsed))
 }
@@ -93,11 +89,7 @@ impl ClientShellState {
                     .panes
                     .iter()
                     .find(|pane| pane.pane_id == pane_id)
-                    .and_then(|pane| {
-                        pane.foreground_cwd
-                            .clone()
-                            .or_else(|| pane.cwd.clone())
-                    })
+                    .and_then(|pane| pane.foreground_cwd.clone().or_else(|| pane.cwd.clone()))
             })
             .or_else(|| {
                 self.snapshot.as_deref().and_then(|snapshot| {
@@ -288,10 +280,7 @@ mod tests {
                 "/repo",
             ]
         );
-        assert!(launch
-            .env
-            .iter()
-            .any(|(k, v)| k == "HERDR_ENV" && v == "1"));
+        assert!(launch.env.iter().any(|(k, v)| k == "HERDR_ENV" && v == "1"));
         assert!(launch
             .env
             .iter()
