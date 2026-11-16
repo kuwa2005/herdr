@@ -119,6 +119,81 @@ install -m 755 scripts/herdr_agent_turns.py ~/.local/bin/herdr_agent_turns.py
 journal = false
 ```
 
+## リーダーハブ（手動分割・役割非固定）
+
+分割とエージェント起動は **手動**。リーダーは目的に応じて **最大 3 名** の部下（reports）を従え、**部下の役割は固定しない**（名前は身分だけ。毎回 `INSTRUCTION` で役割と作業を割り当てる）。
+
+```text
+報告ペイン (最大3) --agent read--> リーダー --NEXT/INSTRUCTION--> 次の部下
+```
+
+前提:
+
+1. 最大 4 ペイン程度に分割し、各ペインで任意の AI を起動
+2. 現在タブのペインへ名前を一括付与（左上→右下の順。先頭がリーダー）
+3. 部下名に「仕様担当」などをハードコードしない（リーダーが目的ごとに決める）
+
+```bash
+# 名前付け（**シングルペインのタブのみ**。引数なしなら boss,agent-a,agent-b,agent-c）
+# 実行すると 2x2 に分割してから命名する。既に分割済みだと拒否。
+herdr-turns /turn-init
+herdr-turns turn-init boss,agent-a,agent-b,agent-c   # 名前を上書きしたいとき
+# dry-run（分割はしない）
+herdr-turns turn-init --dry-run
+
+# リーダーペイン上でハブ開始（turns / goal）
+herdr-turns /turn-run 3,"リリース判定まで進める"
+# 同等
+herdr-turns turn-run 3,"リリース判定まで進める"
+
+# 手動で同等の長形式:
+herdr-turns \
+  --leader boss \
+  --participant agent-a --participant agent-b --participant agent-c \
+  --turns 3 \
+  --goal "リリース判定まで進める" \
+  --notes-dir ./hub-notes \
+  --workdir "$PWD"
+```
+
+`/turn-run` は **リーダーペイン内**（`HERDR_PANE_ID`）で実行する。現在ペインの名前付きエージェントを `--leader`、同じタブの他の名前付きエージェントを `--participant` に自動割当し、既定で `--daemon` 起動する（notes は `./hub-notes`）。
+
+| フラグ | 意味 |
+| --- | --- |
+| `--leader` | ハブ役（必須） |
+| `--participant` | 部下プール（1〜3。リーダー自身は含めない） |
+| `--order` | 既定の訪問順ヒント（省略時は `--participant` 定義順）。実順序はリーダーの `NEXT` が優先 |
+
+各ステップでリーダーは画面に次を出す:
+
+```text
+NEXT: <部下名>
+INSTRUCTION: <今回の役割と作業>
+STATUS: CONTINUE|DONE|STOP|ESCALATE
+```
+
+`--from-here` のネスト 2x2（director/coder/reviewer）とは別経路。`--leader` 指定時はネスト分割しない。
+
+
+### `/auto-yes`（確認ダイアログ自動 Yes）
+
+エージェントが次のような確認で止まったとき、自動で Yes を選ぶトグル（**既定オフ**）:
+
+```text
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+```
+
+```bash
+herdr-turns /auto-yes          # 有効化（watcher 起動）
+herdr-turns /auto-yes          # もう一度で無効化
+herdr-turns auto-yes status    # 状態確認
+```
+
+有効中は blocked（および検出できた proceed 確認）に対し `1`+Enter（または `[Y/n]` なら `y`+Enter）を送る。状態は `~/.config/herdr/auto-yes.json`。
+
+
 ## マルチエージェント自動化（自己進化）
 
 Herdr 本体に「A→B 自動パイプ」はない。この fork の公式ワークフローは **最大 10 ターンの自己進化ループ**。

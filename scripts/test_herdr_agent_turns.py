@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import tempfile
@@ -2863,6 +2864,290 @@ class HerdrAgentTurnsTests(unittest.TestCase):
             cmd = popen.call_args[0][0]
             self.assertNotIn("--daemon", cmd)
             self.assertIn("--notes-dir", cmd)
+
+
+class LeaderHubRoutingTests(unittest.TestCase):
+    def _ns(self, **kwargs):
+        ns = argparse.Namespace(
+            leader=None,
+            participants=None,
+            order=None,
+        )
+        for key, value in kwargs.items():
+            setattr(ns, key, value)
+        return ns
+
+    def test_resolve_leader_hub_allows_up_to_three_flexible_reports(self) -> None:
+        route = turns.resolve_leader_hub_route(
+            self._ns(leader="lead", participants=["alpha", "beta", "gamma"])
+        )
+        self.assertEqual(route.leader, "lead")
+        self.assertEqual(route.workers, ["alpha", "beta", "gamma"])
+        self.assertEqual(route.order, ["alpha", "beta", "gamma"])
+        self.assertEqual(turns.MAX_HUB_WORKERS, 3)
+
+    def test_resolve_leader_hub_rejects_four_reports_and_leader_in_pool(self) -> None:
+        with self.assertRaises(RuntimeError):
+            turns.resolve_leader_hub_route(
+                self._ns(
+                    leader="lead",
+                    participants=["a", "b", "c", "d"],
+                )
+            )
+        with self.assertRaises(RuntimeError):
+            turns.resolve_leader_hub_route(
+                self._ns(leader="Lead", participants=["lead", "other"])
+            )
+
+    def test_resolve_leader_hub_order_override_among_reports(self) -> None:
+        route = turns.resolve_leader_hub_route(
+            self._ns(
+                leader="boss",
+                participants=["a", "b", "c"],
+                order="c,a,b",
+            )
+        )
+        self.assertEqual(route.order, ["c", "a", "b"])
+
+    def test_parse_leader_directive_flexible_next_and_instruction(self) -> None:
+        text = (
+            "thinking...\n"
+            "NEXT: beta\n"
+            "INSTRUCTION: Act as verifier; check the diff and report gaps.\n"
+            "More detail for beta.\n"
+            "STATUS: CONTINUE\n"
+        )
+        d = turns.parse_leader_directive(
+            text,
+            known_agents=["boss", "alpha", "beta", "gamma"],
+            default_next="alpha",
+        )
+        self.assertEqual(d.next_agent, "beta")
+        self.assertEqual(d.status, "CONTINUE")
+        self.assertIsNotNone(d.instruction)
+        assert d.instruction is not None
+        self.assertIn("Act as verifier", d.instruction)
+        self.assertIn("More detail for beta", d.instruction)
+
+    def test_parse_leader_directive_defaults_next_and_done(self) -> None:
+        d = turns.parse_leader_directive(
+            "STATUS: DONE\nNo more work.\n",
+            known_agents=["boss", "a", "b"],
+            default_next="a",
+        )
+        self.assertEqual(d.status, "DONE")
+        self.assertEqual(d.next_agent, "a")
+
+    def test_wants_leader_hub_and_nested_disabled(self) -> None:
+        hub = self._ns(leader="boss", participants=["a"])
+        hub.from_here = True
+        setattr(hub, "self", False)
+        self.assertTrue(turns.wants_leader_hub(hub))
+        self.assertFalse(turns.wants_nested_pair(hub))
+
+    def test_leader_briefing_mentions_roles_not_fixed(self) -> None:
+        route = turns.LeaderHubRoute(
+            leader="boss",
+            workers=["a", "b"],
+            order=["a", "b"],
+        )
+        prompt = turns.leader_briefing_prompt(
+            turn=1,
+            turns=3,
+            step=1,
+            steps=2,
+            route=route,
+            goal="ship feature",
+            workdir=Path("/repo"),
+            notes_dir=Path("/notes"),
+            default_next="a",
+            last_agent=None,
+            last_output="(empty)",
+        )
+        self.assertIn("NOT fixed", prompt)
+        self.assertIn("Report pool", prompt)
+        self.assertNotIn("project-leader", prompt.lower())
+
+
+
+
+class TurnInitTests(unittest.TestCase):
+    def test_parse_turn_init_names_basic_and_slash(self) -> None:
+        self.assertEqual(
+            turns.parse_turn_init_names("boss,agent-a,agent-b,agent-c"),
+            ["boss", "agent-a", "agent-b", "agent-c"],
+        )
+        self.assertEqual(
+            turns.parse_turn_init_names("/turn-init boss, a, b"),
+            ["boss", "a", "b"],
+        )
+        self.assertEqual(
+            turns.parse_turn_init_names(""),
+            ["boss", "agent-a", "agent-b", "agent-c"],
+        )
+        self.assertEqual(
+            turns.parse_turn_init_names("/turn-init"),
+            list(turns.DEFAULT_TURN_INIT_NAMES),
+        )
+        self.assertEqual(
+            turns.extract_turn_init_argv(["/turn-init"]),
+            ("", False),
+        )
+        with self.assertRaises(ValueError):
+            turns.parse_turn_init_names("only-one")
+        with self.assertRaises(ValueError):
+            turns.parse_turn_init_names("a,b,c,d,e")
+        with self.assertRaises(ValueError):
+            turns.parse_turn_init_names("a,a")
+
+    def test_build_turn_init_assignments_visual_order(self) -> None:
+        panes = [
+            {"pane_id": "w1:p2", "rect": {"x": 10, "y": 0}},
+            {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}},
+            {"pane_id": "w1:p3", "rect": {"x": 0, "y": 10}},
+        ]
+        panes_sorted = sorted(panes, key=turns.pane_sort_key)
+        assigns = turns.build_turn_init_assignments(
+            panes_sorted, ["boss", "a", "b"]
+        )
+        self.assertEqual(
+            assigns,
+            [("w1:p1", "boss"), ("w1:p2", "a"), ("w1:p3", "b")],
+        )
+        with self.assertRaises(ValueError):
+            turns.build_turn_init_assignments(panes_sorted[:1], ["boss", "a"])
+
+    def test_require_turn_init_single_pane(self) -> None:
+        self.assertEqual(
+            turns.require_turn_init_single_pane(
+                [{"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}}]
+            ),
+            "w1:p1",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            turns.require_turn_init_single_pane(
+                [
+                    {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}},
+                    {"pane_id": "w1:p2", "rect": {"x": 10, "y": 0}},
+                ]
+            )
+        self.assertIn("single pane", str(ctx.exception))
+
+    def test_extract_turn_init_argv_forms(self) -> None:
+        self.assertEqual(
+            turns.extract_turn_init_argv(["turn-init", "boss,a,b"]),
+            ("boss,a,b", False),
+        )
+        self.assertEqual(
+            turns.extract_turn_init_argv(["/turn-init", "boss,a,b", "--dry-run"]),
+            ("boss,a,b", True),
+        )
+        self.assertEqual(
+            turns.extract_turn_init_argv(["/turn-init=boss,a"]),
+            ("boss,a", False),
+        )
+        self.assertIsNone(turns.extract_turn_init_argv(["--leader", "boss"]))
+
+    def test_format_turn_init_launch_hint(self) -> None:
+        hint = turns.format_turn_init_launch_hint(["boss", "a", "b"])
+        self.assertIn("--leader boss", hint)
+        self.assertIn("--participant a", hint)
+        self.assertIn("--participant b", hint)
+
+
+
+
+class TurnRunTests(unittest.TestCase):
+    def test_parse_turn_run_spec(self) -> None:
+        self.assertEqual(
+            turns.parse_turn_run_spec('3,"ship the feature"'),
+            (3, "ship the feature"),
+        )
+        self.assertEqual(
+            turns.parse_turn_run_spec("/turn-run 2,improve docs"),
+            (2, "improve docs"),
+        )
+        self.assertEqual(
+            turns.parse_turn_run_spec("turn-run 1,'x'"),
+            (1, "x"),
+        )
+        with self.assertRaises(ValueError):
+            turns.parse_turn_run_spec('0,"x"')
+        with self.assertRaises(ValueError):
+            turns.parse_turn_run_spec('3,""')
+
+    def test_extract_turn_run_argv(self) -> None:
+        self.assertEqual(
+            turns.extract_turn_run_argv(["/turn-run", '3,"goal"']),
+            ('3,"goal"', False, None),
+        )
+        spec, dry, notes = turns.extract_turn_run_argv(
+            ["turn-run", "--dry-run", "--notes-dir", "/tmp/n", "2,abc"]
+        )
+        self.assertEqual(spec, "2,abc")
+        self.assertTrue(dry)
+        self.assertEqual(notes, Path("/tmp/n"))
+        self.assertIsNone(turns.extract_turn_run_argv(["--leader", "boss"]))
+
+    def test_build_turn_run_argv(self) -> None:
+        argv = turns.build_turn_run_argv(
+            leader="boss",
+            reports=["a", "b"],
+            turns=3,
+            goal="g",
+            workdir=Path("/repo"),
+            notes_dir=Path("/notes"),
+            daemon=True,
+        )
+        self.assertEqual(argv[0:2], ["--leader", "boss"])
+        self.assertIn("--participant", argv)
+        self.assertIn("a", argv)
+        self.assertIn("--daemon", argv)
+        self.assertIn("--goal", argv)
+        self.assertIn("g", argv)
+
+
+
+
+class AutoYesTests(unittest.TestCase):
+    def test_looks_like_yes_proceed_prompt(self) -> None:
+        sample = (
+            "Parser skipped input between top-level statements\n\n"
+            "Do you want to proceed?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+        )
+        self.assertTrue(turns.looks_like_yes_proceed_prompt(sample))
+        self.assertEqual(turns.auto_yes_keys_for_prompt(sample), ["1", "enter"])
+        self.assertFalse(turns.looks_like_yes_proceed_prompt("just idle text"))
+        yn = "Continue? [Y/n]"
+        self.assertTrue(turns.looks_like_yes_proceed_prompt(yn))
+        self.assertEqual(turns.auto_yes_keys_for_prompt(yn), ["y", "enter"])
+
+    def test_extract_auto_yes_argv(self) -> None:
+        self.assertEqual(turns.extract_auto_yes_argv(["/auto-yes"]), "toggle")
+        self.assertEqual(turns.extract_auto_yes_argv(["auto-yes"]), "toggle")
+        self.assertEqual(
+            turns.extract_auto_yes_argv(["auto-yes", "status"]), "status"
+        )
+        self.assertEqual(turns.extract_auto_yes_argv(["auto-yes-watch"]), "watch")
+        self.assertIsNone(turns.extract_auto_yes_argv(["/turn-init"]))
+
+    def test_auto_yes_state_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "herdr" / "auto-yes.json"
+            with mock.patch.object(turns, "auto_yes_state_path", return_value=fake):
+                self.assertFalse(turns.is_auto_yes_enabled())
+                turns.save_auto_yes_state(
+                    {"enabled": True, "pid": 1, "log": "/tmp/x"}
+                )
+                self.assertTrue(turns.is_auto_yes_enabled())
+                turns.save_auto_yes_state(
+                    {"enabled": False, "pid": None, "log": None}
+                )
+                self.assertFalse(turns.is_auto_yes_enabled())
+
+
 
 
 if __name__ == "__main__":

@@ -28,6 +28,27 @@ session (use ``--keep-nested`` to leave it).
 Use ``--self`` to keep the old single-pane self-review mode. Explicit
 ``--coder`` / ``--reviewer`` (without ``--from-here``) targets existing agents.
 
+Manual multi-party (2–4 already-running named agents, no nest/split):
+
+* **Leader hub** (preferred): ``--leader NAME`` plus up to 3
+  ``--participant`` reports (subordinates). Roles are **not fixed** —
+  the leader assigns duties per goal via ``NEXT`` / ``INSTRUCTION`` /
+  ``STATUS``. Each step reads a report's TUI, briefs the leader, then
+  prompts the chosen report. See ``resolve_leader_hub_route`` /
+  ``run_leader_hub_turns``.
+* **Init names**: ``herdr-turns /turn-init`` (defaults to
+  ``boss,agent-a,agent-b,agent-c``) only on a **single-pane** tab; it
+  splits to a grid then renames panes in visual order.
+* **Run hub**: from the leader pane, ``herdr-turns /turn-run 3,"goal"``
+  (or ``turn-run 3,"goal"``) starts the leader-hub loop (daemon) using
+  the current pane as ``--leader`` and other named agents in the tab as
+  ``--participant``.
+* **Auto-yes**: ``herdr-turns /auto-yes`` toggles a background watcher
+  (default off) that answers Yes/proceed confirmations on blocked agent
+  panes. Run ``/auto-yes`` again to disable.
+* **Legacy order map**: ``--participant`` without ``--leader`` still maps
+  onto planner/coder/reviewer via ``resolve_multiparty_route``.
+
 Wave 3 (AI-driven): ``--goal-file`` / ``--task-pack``, ``--test-command``,
 per-role ``--*-arg``, bundled default constraints, ``--notify-webhook`` —
 see ``FORK.md`` 「AI駆動・自己進化（wave 3）」.
@@ -54,6 +75,19 @@ from typing import Any
 
 MAX_TURNS = 10
 DEFAULT_TURNS = 10
+# Manual multi-party conversation (already-running named agents; no nest/split).
+MIN_PARTICIPANTS = 2
+MAX_PARTICIPANTS = 4
+# Leader hub: 1 leader + 1..3 workers (total still capped at MAX_PARTICIPANTS).
+MIN_HUB_WORKERS = 1
+MAX_HUB_WORKERS = MAX_PARTICIPANTS - 1
+HUB_READ_LINES = 80
+HUB_READ_MAX_CHARS = 6_000
+# Default names when ``turn-init`` / ``/turn-init`` is invoked with no args.
+DEFAULT_TURN_INIT_NAMES = ["boss", "agent-a", "agent-b", "agent-c"]
+AUTO_YES_STATE_FILENAME = "auto-yes.json"
+AUTO_YES_POLL_SECONDS = 1.0
+AUTO_YES_COOLDOWN_SECONDS = 2.5
 DEFAULT_TIMEOUT_MS = 600_000
 DEFAULT_POLL_SECONDS = 1.0
 DEFAULT_IDLE_GRACE = 12
@@ -113,6 +147,45 @@ FIELD_RE = re.compile(
     r"(?im)^\s*(TASK|DONE|VERIFIED|IMPROVE|EFFECT)\s*:\s*(.+?)\s*$"
 )
 SKELETON_NOISE_RE = re.compile(r"(?im)^\s*(_\(pending\)_|#\s*Turn\b)")
+
+
+@dataclass
+class MultipartyRoute:
+    """Resolved manual multi-party conversation routing.
+
+    ``participants`` is the unique named-agent set in definition order
+    (from repeated ``--participant``). ``order`` is the conversation
+    sequence (defaults to definition order; overridden by ``--order``).
+    """
+
+    participants: list[str]
+    order: list[str]
+
+
+@dataclass
+class LeaderHubRoute:
+    """Leader-hub routing for already-running named agents (no nest/split).
+
+    ``leader`` may command at most three ``workers`` (reports). Worker
+    **roles are not fixed** — names are only identities; the leader assigns
+    duties per goal through ``NEXT`` / ``INSTRUCTION`` / ``STATUS``.
+    ``order`` is an optional default visitation hint among the pool
+    (defaults to ``workers``; overridden by ``--order``); the leader may
+    skip or reorder via ``NEXT``.
+    """
+
+    leader: str
+    workers: list[str]
+    order: list[str]
+
+
+@dataclass
+class LeaderDirective:
+    """Parsed leader reply fields for one hub step."""
+
+    next_agent: str | None
+    instruction: str | None
+    status: str  # CONTINUE | DONE | STOP | ESCALATE
 
 
 @dataclass
@@ -180,6 +253,45 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Director/planner agent for INSTRUCT "
             "(default: director when nesting, else same as --coder)"
+        ),
+    )
+    p.add_argument(
+        "--leader",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Named already-running leader for hub mode. May command up to "
+            f"{MAX_HUB_WORKERS} --participant reports (roles not fixed; "
+            "leader assigns duties per goal). Does not nest or split. "
+            "Each step: read report TUI → prompt leader → prompt NEXT"
+        ),
+    )
+    p.add_argument(
+        "--participant",
+        action="append",
+        default=None,
+        dest="participants",
+        metavar="NAME",
+        help=(
+            "Named already-running agent (repeatable). With --leader: "
+            f"report pool only ({MIN_HUB_WORKERS}–{MAX_HUB_WORKERS}; "
+            "roles not fixed). Without --leader: "
+            f"{MIN_PARTICIPANTS}–{MAX_PARTICIPANTS} agents mapped onto "
+            "planner/coder/reviewer. Does not nest or split. "
+            "Definition order is the default visitation hint "
+            "unless --order is set"
+        ),
+    )
+    p.add_argument(
+        "--order",
+        default=None,
+        metavar="NAMES",
+        help=(
+            "Comma-separated conversation order. With --leader: among worker "
+            "--participant names (default: worker definition order). "
+            "Without --leader: among all --participant names. "
+            "Every listed name in the active set must appear at least once; "
+            "unknown names are rejected"
         ),
     )
     p.add_argument(
@@ -413,6 +525,642 @@ def validate_turns(turns: int) -> str | None:
     return None
 
 
+def wants_manual_multiparty(args: argparse.Namespace) -> bool:
+    """True when ``--participant`` selects manual multi-party routing."""
+    raw = getattr(args, "participants", None)
+    return bool(raw)
+
+
+def parse_participant_names(raw: list[str] | None) -> list[str]:
+    """Normalize repeated ``--participant`` values (strip; keep definition order).
+
+    Raises ``ValueError`` with a CLI-oriented message on empty or duplicate names.
+    Returns ``[]`` when multiparty was not requested.
+    """
+    if not raw:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        name = (item or "").strip()
+        if not name:
+            raise ValueError("--participant values must be non-empty")
+        key = name.casefold()
+        if key in seen:
+            raise ValueError(f"duplicate --participant {name!r}")
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def parse_order_names(raw: str | None) -> list[str] | None:
+    """Parse ``--order`` as comma-separated names.
+
+    Returns ``None`` when ``raw`` is omitted/blank (caller uses definition order).
+    Raises ``ValueError`` when the string is non-blank but yields no names.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    names: list[str] = []
+    for part in text.split(","):
+        name = part.strip()
+        if not name:
+            raise ValueError("--order entries must be non-empty (check commas)")
+        names.append(name)
+    if not names:
+        raise ValueError("--order must list at least one participant name")
+    return names
+
+
+def validate_participants(names: list[str]) -> str | None:
+    """Return an error when participant count is outside 2–4; else None."""
+    n = len(names)
+    if n < MIN_PARTICIPANTS:
+        return (
+            f"--participant requires at least {MIN_PARTICIPANTS} named agents "
+            f"(got {n})"
+        )
+    if n > MAX_PARTICIPANTS:
+        return (
+            f"--participant accepts at most {MAX_PARTICIPANTS} named agents "
+            f"(got {n}; hard cap)"
+        )
+    return None
+
+
+def validate_conversation_order(
+    participants: list[str], order: list[str]
+) -> str | None:
+    """Ensure ``order`` only names known participants and covers each once+.
+
+    Matching is case-insensitive against ``participants``.
+    """
+    if not order:
+        return "--order must list at least one participant name"
+    by_key = {p.casefold(): p for p in participants}
+    seen_keys: set[str] = set()
+    for name in order:
+        key = name.casefold()
+        if key not in by_key:
+            return (
+                f"--order names unknown participant {name!r} "
+                f"(known: {', '.join(participants)})"
+            )
+        seen_keys.add(key)
+    missing = [p for p in participants if p.casefold() not in seen_keys]
+    if missing:
+        return (
+            "--order must include every --participant at least once "
+            f"(missing: {', '.join(missing)})"
+        )
+    return None
+
+
+def canonicalize_order(
+    participants: list[str], order: list[str]
+) -> list[str]:
+    """Rewrite ``order`` entries to the spelling used in ``participants``."""
+    by_key = {p.casefold(): p for p in participants}
+    return [by_key[name.casefold()] for name in order]
+
+
+def resolve_multiparty_route(args: argparse.Namespace) -> MultipartyRoute:
+    """Parse/validate ``--participant`` / ``--order`` into a ``MultipartyRoute``.
+
+    Definition order of ``--participant`` is the default conversation order.
+    ``--order`` overrides that sequence. Raises ``RuntimeError`` when multiparty
+    was not requested or validation fails (count, duplicates, unknown names).
+    """
+    if not wants_manual_multiparty(args):
+        raise RuntimeError(
+            "resolve_multiparty_route requires --participant "
+            f"({MIN_PARTICIPANTS}–{MAX_PARTICIPANTS} named agents)"
+        )
+    try:
+        participants = parse_participant_names(
+            getattr(args, "participants", None)
+        )
+    except ValueError as err:
+        raise RuntimeError(str(err)) from err
+    err = validate_participants(participants)
+    if err is not None:
+        raise RuntimeError(err)
+    try:
+        parsed_order = parse_order_names(getattr(args, "order", None))
+    except ValueError as err:
+        raise RuntimeError(str(err)) from err
+    order = list(participants) if parsed_order is None else parsed_order
+    err = validate_conversation_order(participants, order)
+    if err is not None:
+        raise RuntimeError(err)
+    return MultipartyRoute(
+        participants=list(participants),
+        order=canonicalize_order(participants, order),
+    )
+
+
+def legacy_roles_from_multiparty(route: MultipartyRoute) -> tuple[str, str, str]:
+    """Map a multiparty route onto planner/coder/reviewer for the 3-step loop.
+
+    ``order[0]``→planner, ``order[1]``→coder, ``order[2]`` if present else
+    ``order[-1]``→reviewer. Extra names beyond three stay on the route and are
+    prompted via ``multiparty_handoff_prompt`` after REVIEW.
+    """
+    order = route.order
+    planner = order[0]
+    coder = order[1]
+    reviewer = order[2] if len(order) >= 3 else order[-1]
+    return planner, coder, reviewer
+
+
+def multiparty_handoff_prompt(
+    *,
+    turn: int,
+    turns: int,
+    agent: str,
+    route: MultipartyRoute,
+    goal: str,
+    workdir: Path,
+    notes_dir: Path,
+    step_index: int,
+) -> str:
+    """Prompt for participants beyond the planner/coder/reviewer trio."""
+    order_s = " → ".join(route.order)
+    return (
+        f"Turn {turn}/{turns} MULTIPARTY handoff (step {step_index + 1}/"
+        f"{len(route.order)} → you are {agent}).\n"
+        f"Workdir: {workdir}\n"
+        f"Overall goal: {goal}\n"
+        f"Conversation order: {order_s}\n"
+        f"Prior artifacts (read these): {notes_dir}/TURN{turn}_PLAN.md, "
+        f"{notes_dir}/TURN{turn}_RESULT.md, {notes_dir}/TURN{turn}_REVIEW.md.\n"
+        f"Continue the pane-to-pane conversation from your role. "
+        f"Do not commit unless asked.\n"
+    )
+
+
+LEADER_NEXT_RE = re.compile(r"(?im)^\s*NEXT\s*:\s*(\S+)\s*$")
+LEADER_STATUS_RE = re.compile(
+    r"(?im)^\s*STATUS\s*:\s*(CONTINUE|DONE|STOP|ESCALATE)\s*$"
+)
+LEADER_INSTRUCTION_LINE_RE = re.compile(r"(?im)^\s*INSTRUCTION\s*:\s*(.*)$")
+
+
+def wants_leader_hub(args: argparse.Namespace) -> bool:
+    """True when ``--leader`` selects leader-hub orchestration."""
+    leader = getattr(args, "leader", None)
+    return bool(leader and str(leader).strip())
+
+
+def resolve_leader_hub_route(args: argparse.Namespace) -> LeaderHubRoute:
+    """Parse/validate ``--leader`` / ``--participant`` / ``--order`` for hub mode.
+
+    Workers come only from ``--participant`` (leader must not be listed there).
+    ``--order`` is among workers. Raises ``RuntimeError`` on invalid input.
+    """
+    if not wants_leader_hub(args):
+        raise RuntimeError("resolve_leader_hub_route requires --leader")
+    leader = str(args.leader).strip()
+    if not leader:
+        raise RuntimeError("--leader must be a non-empty agent name")
+    try:
+        workers = parse_participant_names(getattr(args, "participants", None))
+    except ValueError as err:
+        raise RuntimeError(str(err)) from err
+    if not workers:
+        raise RuntimeError(
+            "--leader requires --participant for worker agents "
+            f"({MIN_HUB_WORKERS}–{MAX_HUB_WORKERS})"
+        )
+    if any(w.casefold() == leader.casefold() for w in workers):
+        raise RuntimeError(
+            f"--participant must not include --leader {leader!r} "
+            "(list workers only)"
+        )
+    n = len(workers)
+    if n < MIN_HUB_WORKERS:
+        raise RuntimeError(
+            f"--leader needs at least {MIN_HUB_WORKERS} --participant "
+            f"(got {n})"
+        )
+    if n > MAX_HUB_WORKERS:
+        raise RuntimeError(
+            f"--leader accepts at most {MAX_HUB_WORKERS} --participant "
+            f"workers (got {n}; total cap {MAX_PARTICIPANTS})"
+        )
+    try:
+        parsed_order = parse_order_names(getattr(args, "order", None))
+    except ValueError as err:
+        raise RuntimeError(str(err)) from err
+    order = list(workers) if parsed_order is None else parsed_order
+    err = validate_conversation_order(workers, order)
+    if err is not None:
+        raise RuntimeError(err)
+    return LeaderHubRoute(
+        leader=leader,
+        workers=list(workers),
+        order=canonicalize_order(workers, order),
+    )
+
+
+def parse_leader_directive(
+    text: str,
+    *,
+    known_agents: list[str],
+    default_next: str | None = None,
+) -> LeaderDirective:
+    """Extract NEXT / INSTRUCTION / STATUS from a leader pane snapshot."""
+    body = text or ""
+    status_m = LEADER_STATUS_RE.search(body)
+    status = status_m.group(1).upper() if status_m else "CONTINUE"
+
+    next_m = LEADER_NEXT_RE.search(body)
+    next_agent = next_m.group(1).strip() if next_m else None
+    if next_agent:
+        by_key = {a.casefold(): a for a in known_agents}
+        canon = by_key.get(next_agent.casefold())
+        next_agent = canon  # None if unknown — caller may fall back
+
+    instruction: str | None = None
+    instr_m = LEADER_INSTRUCTION_LINE_RE.search(body)
+    if instr_m:
+        first = instr_m.group(1).strip()
+        # Collect following lines until a known field header or blank-heavy end.
+        start = instr_m.end()
+        rest_lines: list[str] = []
+        if first:
+            rest_lines.append(first)
+        for line in body[start:].splitlines():
+            if re.match(
+                r"(?i)^\s*(NEXT|STATUS|INSTRUCTION|VERDICT|TASK|DONE_WHEN)\s*:",
+                line,
+            ):
+                break
+            rest_lines.append(line.rstrip())
+        instruction = "\n".join(rest_lines).strip() or None
+
+    if next_agent is None and default_next is not None:
+        next_agent = default_next
+    return LeaderDirective(
+        next_agent=next_agent,
+        instruction=instruction,
+        status=status,
+    )
+
+
+def agent_read_text(
+    herdr: str,
+    target: str,
+    *,
+    source: str = "detection",
+    lines: int = HUB_READ_LINES,
+    max_chars: int = HUB_READ_MAX_CHARS,
+    env: dict[str, str | None] | None = None,
+) -> str:
+    """Read plain-text agent pane output (``herdr agent read`` is not JSON)."""
+    cmd = [
+        herdr,
+        "agent",
+        "read",
+        target,
+        "--source",
+        source,
+        "--lines",
+        str(lines),
+    ]
+    run_env: dict[str, str] | None = None
+    if env is not None:
+        run_env = os.environ.copy()
+        for key, value in env.items():
+            if value is None:
+                run_env.pop(key, None)
+            else:
+                run_env[key] = value
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, env=run_env
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` exited {proc.returncode}"
+            + (f": {err}" if err else "")
+        )
+    text = proc.stdout or ""
+    # If the CLI ever wraps JSON with a text field, prefer that.
+    stripped = text.strip()
+    if stripped.startswith("{") and '"result"' in stripped[:200]:
+        try:
+            payload = json.loads(stripped)
+            result = payload.get("result") if isinstance(payload, dict) else None
+            if isinstance(result, dict):
+                for key in ("text", "content", "output"):
+                    val = result.get(key)
+                    if isinstance(val, str):
+                        text = val
+                        break
+                read = result.get("read")
+                if isinstance(read, dict) and isinstance(read.get("text"), str):
+                    text = read["text"]
+                elif isinstance(read, str):
+                    text = read
+        except json.JSONDecodeError:
+            pass
+    return _truncate_chars(text, max_chars)
+
+
+def leader_briefing_prompt(
+    *,
+    turn: int,
+    turns: int,
+    step: int,
+    steps: int,
+    route: LeaderHubRoute,
+    goal: str,
+    workdir: Path,
+    notes_dir: Path,
+    default_next: str,
+    last_agent: str | None,
+    last_output: str,
+    acceptance: str | None = None,
+) -> str:
+    """Ask the leader to choose NEXT / INSTRUCTION / STATUS from TUI evidence."""
+    workers_s = ", ".join(route.workers)
+    order_s = " → ".join(route.order)
+    known = ", ".join([route.leader, *route.workers])
+    acc = format_acceptance_block(acceptance)
+    last_label = last_agent or "(none)"
+    return (
+        f"Turn {turn}/{turns} LEADER HUB (step {step}/{steps}).\n"
+        f"You are the leader agent `{route.leader}`.\n"
+        f"You may command at most 3 reports; their roles are NOT fixed — "
+        f"assign duties based on the current goal.\n"
+        f"Workdir: {workdir}\n"
+        f"Overall goal: {goal}\n"
+        f"{acc}"
+        f"Report pool (names only): {workers_s}\n"
+        f"Default visitation hint: {order_s}\n"
+        f"Default NEXT if you omit NEXT: {default_next}\n"
+        f"Last report: {last_label}\n"
+        f"Reply on screen with EXACTLY these fields:\n"
+        f"NEXT: <one name from the report pool>\n"
+        f"INSTRUCTION: <role + task for that report this step>\n"
+        f"STATUS: CONTINUE|DONE|STOP|ESCALATE\n"
+        f"Known agents: {known}\n"
+        f"Notes path hint: {notes_dir}/TURN{turn}_LEADER_STEP{step}.md\n"
+        f"--- TUI output from last report (truncated) ---\n"
+        f"{last_output.strip() or '_(empty)_'}\n"
+        f"--- end ---\n"
+        f"Choose who acts next and what role they play from the evidence. "
+        f"Do not commit unless asked.\n"
+    )
+
+
+def worker_assignment_prompt(
+    *,
+    turn: int,
+    turns: int,
+    step: int,
+    steps: int,
+    worker: str,
+    leader: str,
+    goal: str,
+    workdir: Path,
+    instruction: str,
+) -> str:
+    """Forward the leader's instruction to a worker agent."""
+    return (
+        f"Turn {turn}/{turns} REPORT assignment "
+        f"(step {step}/{steps} → you are `{worker}`).\n"
+        f"From leader `{leader}`. Your role is whatever INSTRUCTION says "
+        f"(not a fixed job title).\n"
+        f"Workdir: {workdir}\n"
+        f"Overall goal: {goal}\n"
+        f"INSTRUCTION:\n{instruction.strip()}\n"
+        f"Do that work in this pane. When done, leave a clear on-screen summary "
+        f"for the leader. Do not commit unless asked.\n"
+    )
+
+
+def run_leader_hub_turns(
+    args: argparse.Namespace,
+    *,
+    workdir: Path,
+    notes_dir: Path,
+    start_turn: int,
+    end_turn: int,
+    route: LeaderHubRoute,
+    cli_env: dict[str, str | None] | None = None,
+) -> int:
+    """Run leader-hub turns: read worker → brief leader → prompt NEXT worker."""
+    ensure_notes_dir(notes_dir)
+    known = [route.leader, *route.workers]
+    records_notes: list[str] = []
+    stop_reason: str | None = None
+    exit_code = 0
+    acceptance = getattr(args, "acceptance", None)
+
+    print(
+        "leader-hub: leader="
+        + route.leader
+        + " reports="
+        + ",".join(route.workers)
+        + " (max "
+        + str(MAX_HUB_WORKERS)
+        + "; roles not fixed) order="
+        + "→".join(route.order)
+        + " (manual layout; no nest/split)",
+        flush=True,
+    )
+
+    for turn in range(start_turn, end_turn + 1):
+        hub_path = notes_dir / f"TURN{turn}_HUB.md"
+        write_skeleton(hub_path, f"Turn {turn} leader hub")
+        steps_log: list[str] = [f"# Turn {turn} leader hub\n"]
+        last_agent: str | None = None
+        last_output = (
+            "(start of turn — no worker output yet; "
+            "choose the first worker and give an initial INSTRUCTION)"
+        )
+        turn_stopped = False
+
+        for step_index, default_next in enumerate(route.order, start=1):
+            steps = len(route.order)
+            briefing = leader_briefing_prompt(
+                turn=turn,
+                turns=end_turn,
+                step=step_index,
+                steps=steps,
+                route=route,
+                goal=args.goal,
+                workdir=workdir,
+                notes_dir=notes_dir,
+                default_next=default_next,
+                last_agent=last_agent,
+                last_output=last_output,
+                acceptance=acceptance,
+            )
+            step_leader_path = notes_dir / f"TURN{turn}_LEADER_STEP{step_index}.md"
+            print(
+                f"======== TURN {turn}/{end_turn}: "
+                f"leader[{step_index}] → {route.leader} ========",
+                flush=True,
+            )
+            if args.dry_run:
+                print(briefing)
+                step_leader_path.write_text(
+                    f"# Turn {turn} leader step {step_index}\n\n"
+                    f"NEXT: {default_next}\n"
+                    f"INSTRUCTION: dry-run placeholder for {default_next}\n"
+                    f"STATUS: CONTINUE\n",
+                    encoding="utf-8",
+                )
+                directive = LeaderDirective(
+                    next_agent=default_next,
+                    instruction=f"dry-run placeholder for {default_next}",
+                    status="CONTINUE",
+                )
+            else:
+                prompt_and_wait(
+                    args.herdr,
+                    route.leader,
+                    briefing,
+                    timeout_ms=args.timeout_ms,
+                    env=cli_env,
+                )
+                leader_text = agent_read_text(
+                    args.herdr, route.leader, env=cli_env
+                )
+                step_leader_path.write_text(
+                    f"# Turn {turn} leader step {step_index}\n\n{leader_text}\n",
+                    encoding="utf-8",
+                )
+                directive = parse_leader_directive(
+                    leader_text,
+                    known_agents=known,
+                    default_next=default_next,
+                )
+
+            steps_log.append(
+                f"## Step {step_index}\n"
+                f"- default_next: `{default_next}`\n"
+                f"- NEXT: `{directive.next_agent}`\n"
+                f"- STATUS: `{directive.status}`\n"
+                f"- INSTRUCTION: {directive.instruction or '_(missing)_'}\n"
+            )
+
+            if directive.status in {"DONE", "STOP", "ESCALATE"}:
+                note = (
+                    f"leader STATUS: {directive.status} at turn {turn} "
+                    f"step {step_index}"
+                )
+                records_notes.append(note)
+                steps_log.append(f"\nStopped: {note}\n")
+                turn_stopped = True
+                stop_reason = note
+                if directive.status == "ESCALATE":
+                    write_needs_owner(
+                        notes_dir,
+                        goal=args.goal,
+                        turn=turn,
+                        why=(
+                            directive.instruction
+                            or "leader STATUS: ESCALATE"
+                        ),
+                    )
+                    exit_code = 1
+                break
+
+            worker = directive.next_agent or default_next
+            if worker.casefold() == route.leader.casefold():
+                raise RuntimeError(
+                    "leader hub NEXT must name a worker, not the leader"
+                )
+            if worker.casefold() not in {w.casefold() for w in route.workers}:
+                raise RuntimeError(
+                    f"leader NEXT {worker!r} is not a known worker "
+                    f"(workers: {', '.join(route.workers)})"
+                )
+            # Canonical spelling
+            worker = next(w for w in route.workers if w.casefold() == worker.casefold())
+            instruction = (directive.instruction or "").strip()
+            if not instruction:
+                instruction = (
+                    f"Continue the overall goal ({args.goal}) from your role "
+                    f"`{worker}`. Leave a clear on-screen summary when done."
+                )
+
+            assignment = worker_assignment_prompt(
+                turn=turn,
+                turns=end_turn,
+                step=step_index,
+                steps=steps,
+                worker=worker,
+                leader=route.leader,
+                goal=args.goal,
+                workdir=workdir,
+                instruction=instruction,
+            )
+            print(
+                f"======== TURN {turn}/{end_turn}: "
+                f"worker[{step_index}] → {worker} ========",
+                flush=True,
+            )
+            if args.dry_run:
+                print(assignment)
+                last_output = f"(dry-run) {worker} would run: {instruction}"
+            else:
+                prompt_and_wait(
+                    args.herdr,
+                    worker,
+                    assignment,
+                    timeout_ms=args.timeout_ms,
+                    env=cli_env,
+                )
+                last_output = agent_read_text(args.herdr, worker, env=cli_env)
+            last_agent = worker
+            worker_snap = notes_dir / f"TURN{turn}_WORKER_{worker}_STEP{step_index}.md"
+            worker_snap.write_text(
+                f"# Turn {turn} worker `{worker}` step {step_index}\n\n"
+                f"{last_output}\n",
+                encoding="utf-8",
+            )
+            steps_log.append(
+                f"- worker `{worker}` snapshot → `{worker_snap.name}`\n"
+            )
+
+        hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
+        if turn_stopped:
+            break
+
+    if stop_reason:
+        print(f"leader-hub stopped: {stop_reason}", flush=True)
+    else:
+        print(
+            f"leader-hub finished turns {start_turn}–{end_turn}",
+            flush=True,
+        )
+        # Write a lightweight COMPLETE when the loop exhausted turns without escalate.
+        if exit_code == 0 and not (notes_dir / "NEEDS_OWNER.md").exists():
+            complete = notes_dir / "COMPLETE.md"
+            if not complete.exists():
+                complete.write_text(
+                    "# Complete\n\n"
+                    f"goal: {args.goal}\n"
+                    f"mode: leader-hub\n"
+                    f"leader: {route.leader}\n"
+                    f"workers: {', '.join(route.workers)}\n"
+                    f"turns: {start_turn}-{end_turn}\n"
+                    f"notes: see TURN*_HUB.md\n",
+                    encoding="utf-8",
+                )
+    if records_notes:
+        print("notes: " + "; ".join(records_notes), flush=True)
+    return exit_code
+
+
 def automation_target_for_agent(agent: dict[str, Any]) -> str | None:
     name = agent.get("name")
     if isinstance(name, str) and name.strip():
@@ -475,6 +1223,8 @@ def resolve_roles(args: argparse.Namespace) -> tuple[str, str, str]:
 
 def wants_nested_pair(args: argparse.Namespace) -> bool:
     """True when --from-here should nest a 2x2 director/coder/reviewer team."""
+    if wants_leader_hub(args) or wants_manual_multiparty(args):
+        return False
     return bool(args.from_here) and not bool(args.self)
 
 
@@ -968,8 +1718,8 @@ def daemonize(argv: list[str], *, notes_dir: Path) -> int:
                 "log": str(log_path),
                 "notes_dir": str(notes_dir),
                 "message": (
-                    "self-evolve runner started in background; "
-                    "nested director/coder/reviewer (2x2) will start after idle grace"
+                    "turns runner started in background "
+                    "(leader-hub or nested self-evolve; see runner.log)"
                 ),
             },
             ensure_ascii=False,
@@ -2731,6 +3481,8 @@ def prompt_and_wait(
         if status in {"working", "blocked"}:
             saw_work = True
             idle_ticks = 0
+            if status == "blocked":
+                try_auto_yes_for_target(herdr, target, env=env)
         elif status in {"idle", "done"}:
             if saw_work:
                 prepare_agent(herdr, target, env=env)
@@ -2776,6 +3528,34 @@ def run_turns(args: argparse.Namespace) -> int:
     if args.daemon and not args.dry_run:
         # Rebuild argv from sys.argv[1:] so flags stay faithful.
         return daemonize(sys.argv[1:], notes_dir=notes_dir)
+
+    if wants_leader_hub(args):
+        try:
+            hub_route = resolve_leader_hub_route(args)
+        except RuntimeError as err:
+            print(str(err), file=sys.stderr)
+            return 2
+        if not args.resume:
+            write_run_meta(
+                notes_dir,
+                goal=args.goal,
+                workdir=workdir,
+                max_turns=args.turns,
+                constraints=constraints,
+                use_default_constraints=bool(
+                    getattr(args, "use_default_constraints", False)
+                ),
+                test_command=getattr(args, "test_command", None),
+            )
+        return run_leader_hub_turns(
+            args,
+            workdir=workdir,
+            notes_dir=notes_dir,
+            start_turn=start_turn,
+            end_turn=end_turn,
+            route=hub_route,
+            cli_env=None,
+        )
 
     owner_reply_inject: str | None = None
     resolved_test_command = getattr(args, "test_command", None)
@@ -2839,8 +3619,22 @@ def run_turns(args: argparse.Namespace) -> int:
 
     cli_env: dict[str, str | None] | None = None
     nested: NestedPair | None = None
+    multiparty_route: MultipartyRoute | None = None
     try:
-        if wants_nested_pair(args):
+        if wants_manual_multiparty(args):
+            multiparty_route = resolve_multiparty_route(args)
+            planner, coder, reviewer = legacy_roles_from_multiparty(
+                multiparty_route
+            )
+            print(
+                "multiparty: participants="
+                + ",".join(multiparty_route.participants)
+                + " order="
+                + "→".join(multiparty_route.order)
+                + " (manual layout; no nest/split)",
+                flush=True,
+            )
+        elif wants_nested_pair(args):
             if args.dry_run:
                 planner, coder, reviewer = "director", "coder", "reviewer"
                 print(
@@ -3140,6 +3934,40 @@ def run_turns(args: argparse.Namespace) -> int:
                     env=cli_env,
                 )
 
+            # Manual multiparty: prompt remaining agents in conversation order
+            # (beyond planner/coder/reviewer) so 3–4 roles exchange in one turn.
+            if multiparty_route is not None and len(multiparty_route.order) > 3:
+                for step_index, agent in enumerate(multiparty_route.order):
+                    if step_index < 3:
+                        continue
+                    handoff = multiparty_handoff_prompt(
+                        turn=turn,
+                        turns=end_turn,
+                        agent=agent,
+                        route=multiparty_route,
+                        goal=args.goal,
+                        workdir=workdir,
+                        notes_dir=notes_dir,
+                        step_index=step_index,
+                    )
+                    print(
+                        f"======== TURN {turn}/{end_turn}: "
+                        f"multiparty[{step_index}]={agent} ========",
+                        flush=True,
+                    )
+                    if args.dry_run:
+                        print(handoff)
+                        rec.notes.append(f"dry-run multiparty handoff → {agent}")
+                    else:
+                        prompt_and_wait(
+                            args.herdr,
+                            agent,
+                            handoff,
+                            timeout_ms=args.timeout_ms,
+                            env=cli_env,
+                        )
+                        rec.notes.append(f"multiparty handoff → {agent}")
+
             review_text = read_text(review_path)
             verdict, verdict_notes = resolve_review_verdict(review_text)
             rec.verdict = verdict
@@ -3281,9 +4109,901 @@ def run_turns(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def parse_turn_init_names(raw: str) -> list[str]:
+    """Parse ``boss,agent-a,agent-b`` into a unique name list (2–4).
+
+    Raises ``ValueError`` with a CLI-oriented message on bad input.
+    """
+    text = (raw or "").strip()
+    # Allow accidental leading slash command text.
+    if text.lower().startswith("/turn-init"):
+        text = text[len("/turn-init") :].strip()
+        if text.startswith(":") or text.startswith("="):
+            text = text[1:].strip()
+    if not text:
+        # Bare ``/turn-init`` → default leader + 3 reports.
+        return list(DEFAULT_TURN_INIT_NAMES)
+    names: list[str] = []
+    seen: set[str] = set()
+    for part in text.replace(" ", ",").split(","):
+        name = part.strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            raise ValueError(f"turn-init duplicate name {name!r}")
+        seen.add(key)
+        names.append(name)
+    if len(names) < MIN_PARTICIPANTS:
+        raise ValueError(
+            f"turn-init needs at least {MIN_PARTICIPANTS} names "
+            f"(leader + reports; got {len(names)})"
+        )
+    if len(names) > MAX_PARTICIPANTS:
+        raise ValueError(
+            f"turn-init accepts at most {MAX_PARTICIPANTS} names "
+            f"(leader + up to {MAX_HUB_WORKERS} reports; got {len(names)})"
+        )
+    return names
+
+
+def pane_sort_key(pane: dict[str, Any]) -> tuple[int, int, str]:
+    """Sort panes top-to-bottom, left-to-right by layout rect."""
+    rect = pane.get("rect") if isinstance(pane.get("rect"), dict) else {}
+    y = int(rect.get("y") or 0)
+    x = int(rect.get("x") or 0)
+    pane_id = str(pane.get("pane_id") or "")
+    return (y, x, pane_id)
+
+
+def list_current_tab_panes_visual(
+    herdr: str,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> list[dict[str, Any]]:
+    """Return current-tab panes ordered visually (top-left → bottom-right)."""
+    payload = herdr_json(herdr, ["pane", "layout", "--current"], env=env)
+    result = payload.get("result") if isinstance(payload, dict) else None
+    layout = None
+    if isinstance(result, dict):
+        layout = result.get("layout") if isinstance(result.get("layout"), dict) else result
+    if not isinstance(layout, dict):
+        raise RuntimeError("pane layout: missing layout object")
+    panes = layout.get("panes") or []
+    if not isinstance(panes, list) or not panes:
+        raise RuntimeError("pane layout: no panes in the current tab")
+    ordered = [p for p in panes if isinstance(p, dict) and p.get("pane_id")]
+    ordered.sort(key=pane_sort_key)
+    return ordered
+
+
+def require_turn_init_single_pane(panes: list[dict[str, Any]]) -> str:
+    """Require exactly one pane in the current tab; return its pane_id.
+
+    ``turn-init`` / ``/turn-init`` may only start from a single-pane tab; it
+    then splits to match the name count.
+    """
+    if len(panes) != 1:
+        raise ValueError(
+            "turn-init is only allowed when the current tab has a single pane "
+            f"(found {len(panes)}). Use a fresh tab or close/merge extras first."
+        )
+    pane_id = str(panes[0].get("pane_id") or "").strip()
+    if not pane_id:
+        raise ValueError("turn-init: layout pane missing pane_id")
+    return pane_id
+
+
+def split_pane(
+    herdr: str,
+    pane_id: str,
+    direction: str,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> str:
+    """Split *pane_id* and return the new pane id."""
+    payload = herdr_json(
+        herdr,
+        [
+            "pane",
+            "split",
+            "--pane",
+            pane_id,
+            "--direction",
+            direction,
+            "--no-focus",
+        ],
+        env=env,
+    )
+    result = payload.get("result") if isinstance(payload, dict) else None
+    pane = result.get("pane") if isinstance(result, dict) else None
+    new_id = pane.get("pane_id") if isinstance(pane, dict) else None
+    if not isinstance(new_id, str) or not new_id.strip():
+        raise RuntimeError(
+            f"pane split {pane_id} {direction}: missing result.pane.pane_id"
+        )
+    return new_id.strip()
+
+
+def split_tab_for_turn_init(
+    herdr: str,
+    root_pane_id: str,
+    pane_count: int,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> None:
+    """Grow a single-pane tab into *pane_count* panes (2–4).
+
+    Layouts:
+    - 2: left | right
+    - 3: top-left / bottom-left | right
+    - 4: 2x2 (right, then down on left, then down on right)
+    """
+    if pane_count < 2:
+        return
+    if pane_count > MAX_PARTICIPANTS:
+        raise ValueError(
+            f"turn-init cannot split into {pane_count} panes "
+            f"(max {MAX_PARTICIPANTS})"
+        )
+    right = split_pane(herdr, root_pane_id, "right", env=env)
+    if pane_count == 2:
+        return
+    split_pane(herdr, root_pane_id, "down", env=env)
+    if pane_count == 3:
+        return
+    # pane_count == 4
+    split_pane(herdr, right, "down", env=env)
+
+
+def build_turn_init_assignments(
+    panes: list[dict[str, Any]], names: list[str]
+) -> list[tuple[str, str]]:
+    """Pair visual panes with turn-init names (pane_id, name).
+
+    Requires exactly ``len(names)`` panes after splitting.
+    """
+    if len(panes) != len(names):
+        raise ValueError(
+            f"turn-init expected {len(names)} panes after split "
+            f"(found {len(panes)})"
+        )
+    out: list[tuple[str, str]] = []
+    for pane, name in zip(panes, names, strict=True):
+        pane_id = str(pane.get("pane_id") or "").strip()
+        if not pane_id:
+            raise ValueError("turn-init: layout pane missing pane_id")
+        out.append((pane_id, name))
+    return out
+
+
+def format_turn_init_launch_hint(names: list[str]) -> str:
+    """Suggested ``herdr-turns --leader …`` line after a successful init."""
+    leader, *reports = names
+    parts = [
+        "herdr-turns",
+        f"--leader {leader}",
+    ]
+    for report in reports:
+        parts.append(f"--participant {report}")
+    parts.extend(
+        [
+            "--turns 3",
+            '--goal "YOUR_GOAL"',
+            "--notes-dir ./hub-notes",
+            '--workdir "$PWD"',
+        ]
+    )
+    return " ".join(parts)
+
+
+def run_turn_init(
+    *,
+    herdr: str,
+    names_raw: str,
+    dry_run: bool = False,
+    env: dict[str, str | None] | None = None,
+) -> int:
+    """From a single-pane tab: split to N panes, then name leader+reports."""
+    try:
+        names = parse_turn_init_names(names_raw)
+        panes = list_current_tab_panes_visual(herdr, env=env)
+        root_pane_id = require_turn_init_single_pane(panes)
+    except ValueError as err:
+        print(str(err), file=sys.stderr)
+        return 2
+    except RuntimeError as err:
+        print(str(err), file=sys.stderr)
+        return 1
+
+    print(
+        f"turn-init: single-pane ok ({root_pane_id}); "
+        f"leader={names[0]} reports={','.join(names[1:])} "
+        f"(roles not fixed; will split to {len(names)} panes)",
+        flush=True,
+    )
+    if dry_run:
+        print(
+            f"dry-run: would split into {len(names)} panes then rename "
+            + ", ".join(names),
+            flush=True,
+        )
+        print("next:", format_turn_init_launch_hint(names), flush=True)
+        return 0
+
+    try:
+        split_tab_for_turn_init(herdr, root_pane_id, len(names), env=env)
+        panes = list_current_tab_panes_visual(herdr, env=env)
+        assignments = build_turn_init_assignments(panes, names)
+    except (RuntimeError, ValueError) as err:
+        print(str(err), file=sys.stderr)
+        return 1
+
+    for pane_id, name in assignments:
+        print(f"  {pane_id} → {name}", flush=True)
+        try:
+            herdr_json(herdr, ["agent", "rename", pane_id, name], env=env)
+        except RuntimeError as err:
+            print(
+                f"error: failed to rename {pane_id} → {name}: {err}",
+                file=sys.stderr,
+            )
+            return 1
+    print("next:", format_turn_init_launch_hint(names), flush=True)
+    return 0
+
+
+def extract_turn_init_argv(argv: list[str]) -> tuple[str, bool] | None:
+    """Detect ``turn-init`` / ``/turn-init`` invocation; return (names, dry_run).
+
+    Accepted forms:
+
+    - ``turn-init boss,a,b,c``
+    - ``/turn-init boss,a,b,c``
+    - ``/turn-init=boss,a,b,c``
+    - ``turn-init --dry-run boss,a,b``
+    """
+    if not argv:
+        return None
+    first = argv[0]
+    dry_run = False
+    rest = argv[1:]
+    if first in {"turn-init", "/turn-init"}:
+        names_parts: list[str] = []
+        for item in rest:
+            if item in {"--dry-run", "-n"}:
+                dry_run = True
+                continue
+            names_parts.append(item)
+        return (" ".join(names_parts).strip(), dry_run)
+    if first.startswith("/turn-init=") or first.startswith("turn-init="):
+        raw = first.split("=", 1)[1]
+        for item in rest:
+            if item in {"--dry-run", "-n"}:
+                dry_run = True
+            else:
+                raw = f"{raw} {item}"
+        return (raw.strip(), dry_run)
+    if first.startswith("/turn-init"):
+        # "/turn-init boss,a" as a single argv occasionally
+        rem = first[len("/turn-init") :].lstrip(" :=")
+        if rem:
+            for item in rest:
+                if item in {"--dry-run", "-n"}:
+                    dry_run = True
+                else:
+                    rem = f"{rem} {item}"
+            return (rem.strip(), dry_run)
+    return None
+
+
+
+def parse_turn_run_spec(raw: str) -> tuple[int, str]:
+    """Parse ``3,"goal text"`` / ``3,goal`` into ``(turns, goal)``.
+
+    Accepts an optional ``/turn-run`` or ``turn-run`` prefix in *raw*.
+    """
+    text = (raw or "").strip()
+    lower = text.lower()
+    for prefix in ("/turn-run", "turn-run"):
+        if lower.startswith(prefix):
+            text = text[len(prefix) :].strip()
+            if text[:1] in {":", "="}:
+                text = text[1:].strip()
+            break
+    if not text:
+        raise ValueError(
+            'turn-run requires TURNS,"goal" — e.g. /turn-run 3,"ship the feature"'
+        )
+    match = re.match(
+        r"""^(\d+)\s*[, ]\s*(?:"([^"]*)"|'([^']*)'|(.*))\s*$""",
+        text,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise ValueError(
+            'turn-run could not parse TURNS,"goal" from '
+            f"{raw!r} (example: 3,\"improve docs\")"
+        )
+    turns = int(match.group(1))
+    goal = (match.group(2) or match.group(3) or match.group(4) or "").strip()
+    err = validate_turns(turns)
+    if err is not None:
+        raise ValueError(err.replace("--turns", "turn-run turns"))
+    if not goal:
+        raise ValueError("turn-run goal must be non-empty")
+    return turns, goal
+
+
+def extract_turn_run_argv(
+    argv: list[str],
+) -> tuple[str, bool, Path | None] | None:
+    """Detect ``turn-run`` / ``/turn-run``; return (spec, dry_run, notes_dir).
+
+    Spec is the raw ``3,"goal"`` string (possibly including the slash command
+    when packed into argv[0]).
+    """
+    if not argv:
+        return None
+    first = argv[0]
+    dry_run = False
+    notes_dir: Path | None = None
+    rest = list(argv[1:])
+
+    def _consume_flags(items: list[str]) -> list[str]:
+        nonlocal dry_run, notes_dir
+        out: list[str] = []
+        i = 0
+        while i < len(items):
+            item = items[i]
+            if item in {"--dry-run", "-n"}:
+                dry_run = True
+                i += 1
+                continue
+            if item == "--notes-dir" and i + 1 < len(items):
+                notes_dir = Path(items[i + 1])
+                i += 2
+                continue
+            if item.startswith("--notes-dir="):
+                notes_dir = Path(item.split("=", 1)[1])
+                i += 1
+                continue
+            out.append(item)
+            i += 1
+        return out
+
+    if first in {"turn-run", "/turn-run"}:
+        rest = _consume_flags(rest)
+        return (" ".join(rest).strip(), dry_run, notes_dir)
+    if first.startswith("/turn-run=") or first.startswith("turn-run="):
+        raw = first.split("=", 1)[1]
+        rest = _consume_flags(rest)
+        if rest:
+            raw = f"{raw} {' '.join(rest)}"
+        return (raw.strip(), dry_run, notes_dir)
+    if first.startswith("/turn-run") or first.startswith("turn-run"):
+        # "/turn-run 3,\"goal\"" packed in argv[0], or "/turn-run3,..." 
+        if first.lower().startswith("/turn-run"):
+            rem = first[len("/turn-run") :]
+        else:
+            rem = first[len("turn-run") :]
+        rem = rem.lstrip(" :=")
+        rest = _consume_flags(rest)
+        if rem:
+            raw = rem if not rest else f"{rem} {' '.join(rest)}"
+        else:
+            raw = " ".join(rest)
+        if raw.strip():
+            return (raw.strip(), dry_run, notes_dir)
+    return None
+
+
+def resolve_hub_targets_from_current_tab(
+    herdr: str,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> tuple[str, list[str]]:
+    """Return ``(leader_name, report_names)`` from the current tab.
+
+    Leader is the named agent in ``HERDR_PANE_ID``. Reports are other named
+    agents in the same tab, ordered top-left → bottom-right. Requires prior
+    ``turn-init`` (or equivalent renames).
+    """
+    pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
+    if not pane_id:
+        raise RuntimeError(
+            "turn-run must run inside a Herdr-managed pane "
+            "(missing HERDR_PANE_ID). Focus the leader pane and retry."
+        )
+    panes = list_current_tab_panes_visual(herdr, env=env)
+    pane_ids = [str(p.get("pane_id")) for p in panes]
+    payload = herdr_json(herdr, ["agent", "list"], env=env)
+    agents = (
+        payload.get("result", {}).get("agents")
+        or payload.get("agents")
+        or []
+    )
+    named_by_pane: dict[str, str] = {}
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        pid = str(agent.get("pane_id") or "").strip()
+        if pid not in pane_ids:
+            continue
+        name = agent.get("name")
+        if isinstance(name, str) and name.strip():
+            named_by_pane[pid] = name.strip()
+    if pane_id not in pane_ids:
+        raise RuntimeError(
+            f"turn-run: current pane {pane_id} is not in the current tab layout"
+        )
+    leader = named_by_pane.get(pane_id)
+    if not leader:
+        raise RuntimeError(
+            f"turn-run: pane {pane_id} has no agent name — "
+            "run `herdr-turns turn-init leader,report1,...` first"
+        )
+    reports: list[str] = []
+    for pid in pane_ids:
+        if pid == pane_id:
+            continue
+        name = named_by_pane.get(pid)
+        if name:
+            reports.append(name)
+    if not reports:
+        raise RuntimeError(
+            "turn-run: no other named agents in this tab — "
+            "split panes, start agents, then turn-init"
+        )
+    if len(reports) > MAX_HUB_WORKERS:
+        raise RuntimeError(
+            f"turn-run: at most {MAX_HUB_WORKERS} reports under a leader "
+            f"(found {len(reports)}: {', '.join(reports)})"
+        )
+    return leader, reports
+
+
+def build_turn_run_argv(
+    *,
+    leader: str,
+    reports: list[str],
+    turns: int,
+    goal: str,
+    workdir: Path,
+    notes_dir: Path,
+    daemon: bool = True,
+) -> list[str]:
+    """Build ``herdr_agent_turns.py`` argv for leader-hub mode."""
+    argv: list[str] = [
+        "--leader",
+        leader,
+    ]
+    for report in reports:
+        argv.extend(["--participant", report])
+    argv.extend(
+        [
+            "--turns",
+            str(turns),
+            "--goal",
+            goal,
+            "--notes-dir",
+            str(notes_dir),
+            "--workdir",
+            str(workdir),
+        ]
+    )
+    if daemon:
+        argv.append("--daemon")
+    return argv
+
+
+def run_turn_run(
+    *,
+    herdr: str,
+    spec_raw: str,
+    dry_run: bool = False,
+    notes_dir: Path | None = None,
+    env: dict[str, str | None] | None = None,
+) -> int:
+    """Start leader-hub turns from the current (leader) pane."""
+    try:
+        turns, goal = parse_turn_run_spec(spec_raw)
+        leader, reports = resolve_hub_targets_from_current_tab(herdr, env=env)
+    except (ValueError, RuntimeError) as err:
+        print(str(err), file=sys.stderr)
+        return 2 if isinstance(err, ValueError) else 1
+
+    workdir = Path.cwd().resolve()
+    resolved_notes = (
+        notes_dir.expanduser().resolve()
+        if notes_dir is not None
+        else (workdir / "hub-notes").resolve()
+    )
+    argv = build_turn_run_argv(
+        leader=leader,
+        reports=reports,
+        turns=turns,
+        goal=goal,
+        workdir=workdir,
+        notes_dir=resolved_notes,
+        daemon=not dry_run,
+    )
+    print(
+        "turn-run: leader="
+        + leader
+        + " reports="
+        + ",".join(reports)
+        + f" turns={turns}"
+        + f" notes_dir={resolved_notes}",
+        flush=True,
+    )
+    print("turn-run argv: herdr-turns " + " ".join(argv), flush=True)
+    if dry_run:
+        return 0
+    # Re-enter main without the turn-run subcommand (daemon path).
+    return main(argv)
+
+
+
+# --- /auto-yes: toggle watcher that confirms Yes/proceed prompts ------------
+
+AUTO_YES_HINT_RE = re.compile(
+    r"(?is)(?:"
+    r"do you want to proceed|"
+    r"parser skipped input|"
+    r"would you like to|"
+    r"allow (?:this|the)|"
+    r"approve (?:this|the)|"
+    r"continue\?|"
+    r"proceed\?"
+    r")"
+)
+AUTO_YES_OPTION_RE = re.compile(
+    r"(?im)^\s*(?:[❯›>]\s*)?1\s*[\.\:\)]\s*Yes\b"
+)
+AUTO_YES_YN_RE = re.compile(
+    r"(?i)\[Y/n\]|\(Y/n\)|\byes\s*/\s*no\b|\b\[yes\]\s*/\s*\[no\]"
+)
+
+
+def auto_yes_state_path() -> Path:
+    """Path for persisted auto-yes toggle + watcher pid."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else (Path.home() / ".config")
+    return base / "herdr" / AUTO_YES_STATE_FILENAME
+
+
+def load_auto_yes_state() -> dict[str, Any]:
+    path = auto_yes_state_path()
+    if not path.is_file():
+        return {"enabled": False, "pid": None, "log": None}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"enabled": False, "pid": None, "log": None}
+    if not isinstance(raw, dict):
+        return {"enabled": False, "pid": None, "log": None}
+    return {
+        "enabled": bool(raw.get("enabled")),
+        "pid": raw.get("pid") if isinstance(raw.get("pid"), int) else None,
+        "log": raw.get("log") if isinstance(raw.get("log"), str) else None,
+    }
+
+
+def save_auto_yes_state(state: dict[str, Any]) -> Path:
+    path = auto_yes_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "enabled": bool(state.get("enabled")),
+        "pid": state.get("pid") if isinstance(state.get("pid"), int) else None,
+        "log": state.get("log") if isinstance(state.get("log"), str) else None,
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def is_auto_yes_enabled() -> bool:
+    """True when the auto-yes toggle is on (watcher may still be starting)."""
+    return bool(load_auto_yes_state().get("enabled"))
+
+
+def _pid_is_running(pid: int | None) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def looks_like_yes_proceed_prompt(text: str) -> bool:
+    """Detect Yes/No proceed confirmations that should be auto-accepted."""
+    body = text or ""
+    if AUTO_YES_OPTION_RE.search(body) and (
+        AUTO_YES_HINT_RE.search(body) or "Yes" in body
+    ):
+        return True
+    if AUTO_YES_HINT_RE.search(body) and AUTO_YES_YN_RE.search(body):
+        return True
+    if AUTO_YES_HINT_RE.search(body) and re.search(
+        r"(?im)^\s*(?:[❯›>]\s*)?1\s*[\.\:\)]\s*\S+", body
+    ):
+        # Numbered menu starting at 1 after a proceed hint (Yes often first).
+        return True
+    return False
+
+
+def auto_yes_keys_for_prompt(text: str) -> list[str]:
+    """Keys to send for a detected yes/proceed prompt (default: 1 + enter)."""
+    body = text or ""
+    if AUTO_YES_YN_RE.search(body) and not AUTO_YES_OPTION_RE.search(body):
+        return ["y", "enter"]
+    return ["1", "enter"]
+
+
+def try_auto_yes_for_target(
+    herdr: str,
+    target: str,
+    *,
+    env: dict[str, str | None] | None = None,
+    force: bool = False,
+) -> bool:
+    """If the target shows a Yes/proceed prompt, send Yes. Return True if sent."""
+    if not force and not is_auto_yes_enabled():
+        return False
+    try:
+        text = agent_read_text(
+            herdr,
+            target,
+            source="detection",
+            lines=40,
+            max_chars=4_000,
+            env=env,
+        )
+    except RuntimeError:
+        return False
+    if not looks_like_yes_proceed_prompt(text):
+        return False
+    keys = auto_yes_keys_for_prompt(text)
+    try:
+        prepare_agent(herdr, target, env=env)
+        agent_send_keys(herdr, target, *keys, env=env)
+    except RuntimeError:
+        return False
+    return True
+
+
+def list_agent_targets(
+    herdr: str,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> list[str]:
+    """Return automation targets (name or pane_id) for live agents."""
+    payload = herdr_json(herdr, ["agent", "list"], env=env)
+    agents = (
+        payload.get("result", {}).get("agents")
+        or payload.get("agents")
+        or []
+    )
+    out: list[str] = []
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        target = automation_target_for_agent(agent)
+        if target:
+            out.append(target)
+    return out
+
+
+def run_auto_yes_watch_loop(
+    *,
+    herdr: str,
+    poll_seconds: float = AUTO_YES_POLL_SECONDS,
+    env: dict[str, str | None] | None = None,
+) -> int:
+    """Foreground watcher loop; exits when state.enabled becomes false."""
+    last_sent: dict[str, float] = {}
+    print(f"auto-yes watcher started (herdr={herdr})", flush=True)
+    while True:
+        state = load_auto_yes_state()
+        if not state.get("enabled"):
+            print("auto-yes watcher: disabled; exiting", flush=True)
+            return 0
+        try:
+            payload = herdr_json(herdr, ["agent", "list"], env=env)
+        except RuntimeError as err:
+            print(f"auto-yes watcher: agent list failed: {err}", flush=True)
+            time.sleep(poll_seconds)
+            continue
+        agents = (
+            payload.get("result", {}).get("agents")
+            or payload.get("agents")
+            or []
+        )
+        now = time.monotonic()
+        for agent in agents:
+            if not isinstance(agent, dict):
+                continue
+            target = automation_target_for_agent(agent)
+            if not target:
+                continue
+            status = agent.get("agent_status")
+            # Prefer blocked panes; also scan working for sticky confirm UIs.
+            if status not in {"blocked", "working", "idle", "unknown"}:
+                continue
+            last = last_sent.get(target, 0.0)
+            if now - last < AUTO_YES_COOLDOWN_SECONDS:
+                continue
+            if try_auto_yes_for_target(herdr, target, env=env, force=True):
+                last_sent[target] = now
+                print(
+                    f"auto-yes: sent Yes to {target} (status={status})",
+                    flush=True,
+                )
+        time.sleep(poll_seconds)
+
+
+def stop_auto_yes_watcher() -> None:
+    """Clear enabled flag and terminate a recorded watcher pid if running."""
+    state = load_auto_yes_state()
+    pid = state.get("pid")
+    state["enabled"] = False
+    state["pid"] = None
+    save_auto_yes_state(state)
+    if isinstance(pid, int) and _pid_is_running(pid):
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+
+
+def start_auto_yes_watcher(*, herdr: str) -> dict[str, Any]:
+    """Enable toggle and spawn ``auto-yes-watch`` in the background."""
+    stop_auto_yes_watcher()  # ensure single watcher
+    state_path = auto_yes_state_path()
+    log_path = state_path.with_suffix(".log")
+    script = str(Path(__file__).resolve())
+    cmd = [sys.executable, script, "auto-yes-watch", "--herdr", herdr]
+    log_f = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=os.environ.copy(),
+        )
+    finally:
+        log_f.close()
+    state = {"enabled": True, "pid": proc.pid, "log": str(log_path)}
+    save_auto_yes_state(state)
+    return state
+
+
+def run_auto_yes_toggle(*, herdr: str) -> int:
+    """Toggle auto-yes; print JSON status."""
+    state = load_auto_yes_state()
+    enabled = bool(state.get("enabled")) and _pid_is_running(state.get("pid"))
+    if enabled:
+        stop_auto_yes_watcher()
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "enabled": False,
+                    "message": "auto-yes disabled",
+                    "state": str(auto_yes_state_path()),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    started = start_auto_yes_watcher(herdr=herdr)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "enabled": True,
+                "pid": started.get("pid"),
+                "log": started.get("log"),
+                "message": (
+                    "auto-yes enabled — Yes/proceed prompts on agent panes "
+                    "will be accepted automatically"
+                ),
+                "state": str(auto_yes_state_path()),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def extract_auto_yes_argv(argv: list[str]) -> str | None:
+    """Return mode ``toggle`` / ``watch`` / ``status`` when argv is auto-yes."""
+    if not argv:
+        return None
+    first = argv[0]
+    if first in {"/auto-yes", "auto-yes"}:
+        if len(argv) >= 2 and argv[1] in {"status", "--status"}:
+            return "status"
+        if len(argv) >= 2 and argv[1] in {"watch", "auto-yes-watch"}:
+            return "watch"
+        return "toggle"
+    if first == "auto-yes-watch":
+        return "watch"
+    if first.startswith("/auto-yes"):
+        rem = first[len("/auto-yes") :].lstrip(" :=")
+        if rem in {"status", "--status"}:
+            return "status"
+        return "toggle"
+    return None
+
+
+
 def main(argv: list[str] | None = None) -> int:
     # When argv is provided (tests), temporarily replace sys.argv for --daemon.
     restore_argv = False
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    if "--herdr" in raw_argv:
+        idx = raw_argv.index("--herdr")
+        if idx + 1 < len(raw_argv):
+            herdr = raw_argv[idx + 1]
+
+    auto_yes_mode = extract_auto_yes_argv(raw_argv)
+    if auto_yes_mode == "toggle":
+        return run_auto_yes_toggle(herdr=herdr)
+    if auto_yes_mode == "status":
+        state = load_auto_yes_state()
+        running = bool(state.get("enabled")) and _pid_is_running(state.get("pid"))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "enabled": running,
+                    "pid": state.get("pid") if running else None,
+                    "log": state.get("log"),
+                    "state": str(auto_yes_state_path()),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    if auto_yes_mode == "watch":
+        # Keep enabled sticky while this process is the watcher.
+        state = load_auto_yes_state()
+        state["enabled"] = True
+        state["pid"] = os.getpid()
+        save_auto_yes_state(state)
+        try:
+            return run_auto_yes_watch_loop(herdr=herdr)
+        finally:
+            cur = load_auto_yes_state()
+            if cur.get("pid") == os.getpid():
+                cur["enabled"] = False
+                cur["pid"] = None
+                save_auto_yes_state(cur)
+
+    turn_run = extract_turn_run_argv(raw_argv)
+    if turn_run is not None:
+        spec_raw, dry_run, notes_dir = turn_run
+        return run_turn_run(
+            herdr=herdr,
+            spec_raw=spec_raw,
+            dry_run=dry_run,
+            notes_dir=notes_dir,
+        )
+
+    turn_init = extract_turn_init_argv(raw_argv)
+    if turn_init is not None:
+        names_raw, dry_run = turn_init
+        return run_turn_init(herdr=herdr, names_raw=names_raw, dry_run=dry_run)
+
     if argv is not None:
         saved = sys.argv
         sys.argv = [sys.argv[0], *argv]
