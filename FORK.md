@@ -119,6 +119,8 @@ install -m 755 scripts/herdr_agent_turns.py ~/.local/bin/herdr_agent_turns.py
 journal = false
 ```
 
+> 使い方の専用ガイド: [`docs/FORK_FEATURES.md`](./FORK_FEATURES.md)
+
 ## リーダーハブ（手動分割・役割非固定）
 
 分割とエージェント起動は **手動**。リーダーは目的に応じて **最大 3 名** の部下（reports）を従え、**部下の役割は固定しない**（名前は身分だけ。毎回 `INSTRUCTION` で役割と作業を割り当てる）。

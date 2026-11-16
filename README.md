@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 
 **コーディングエージェントが住むランタイム。**
 
-このリポジトリ（[`kuwa2005/herdr`](https://github.com/kuwa2005/herdr)）は [herdrdev/herdr](https://github.com/herdrdev/herdr) の **日本語寄りフォーク**です。UI 言語（`en` / `ja` / `zh-cn`）やローカル向け修正を載せています。upstream の有用な更新は必要に応じて取り込みます。内部運用は [`FORK.md`](./FORK.md) を参照してください。
+このリポジトリ（[`kuwa2005/herdr`](https://github.com/kuwa2005/herdr)）は [herdrdev/herdr](https://github.com/herdrdev/herdr) の **日本語寄りフォーク**です。UI 言語（`en` / `ja` / `zh-cn`）やローカル向け修正を載せています。upstream の有用な更新は必要に応じて取り込みます。内部運用は [`FORK.md`](./FORK.md)、独自機能の使い方は [`docs/FORK_FEATURES.md`](./FORK_FEATURES.md) を参照してください。
 
 - **閉じても作業は止まらない** — クライアントを閉じたり SSH が切れても、バックグラウンドサーバー上でターミナルが動き続けます。サーバーやマシン再起動後は保存済みレイアウトを復元し、対応エージェントは再開できます（元プロセスは残りません）。[セッション状態 →](https://herdr.dev/ja/docs/session-state/)
 - **複数マシンを一つの窓で** — ローカルと保存済み SSH を並べ、エージェント一覧をまとめ、接続ごとに独立して再接続できます。[リモートマシン →](https://herdr.dev/ja/docs/connecting-machines/)
