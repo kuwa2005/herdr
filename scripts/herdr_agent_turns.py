@@ -4736,6 +4736,27 @@ def format_turn_init_launch_hint(names: list[str]) -> str:
     return " ".join(parts)
 
 
+def format_turn_init_usage(names: list[str]) -> str:
+    """Short usage blurb printed after ``/turn-init``."""
+    leader, *reports = names
+    report_hint = "|".join(reports) if reports else "<report>"
+    return "\n".join(
+        [
+            "使い方:",
+            f"  1. 各ペインで AI を起動（名前: {', '.join(names)}）",
+            f"  2. リーダー `{leader}` にフォーカスして実行:",
+            '       herdr-turns /turn-run 3,"目的"',
+            "  3. リーダーは画面に次を返す:",
+            f"       NEXT: <{report_hint}>",
+            "       ROLE: <任意の短い役割>",
+            "       INSTRUCTION: <そのステップの作業>",
+            "       STATUS: CONTINUE|DONE|STOP|ESCALATE",
+            "  任意: herdr-turns /auto-yes   # 確認ダイアログを自動 Yes",
+            "  詳細: FORK_FEATURES.md",
+        ]
+    )
+
+
 def run_turn_init(
     *,
     herdr: str,
@@ -4768,6 +4789,7 @@ def run_turn_init(
             flush=True,
         )
         print("next:", format_turn_init_launch_hint(names), flush=True)
+        print(format_turn_init_usage(names), flush=True)
         return 0
 
     try:
@@ -4798,12 +4820,7 @@ def run_turn_init(
         # /turn-run re-binds live agents to labels via bind_pane_labels_to_agents.
         try_agent_rename(herdr, pane_id, name, env=env)
     print("next:", format_turn_init_launch_hint(names), flush=True)
-    print(
-        "hint: start agents with the pane label as NAME "
-        "(`herdr agent start <label> --kind … --pane <pane>`), "
-        "or let /turn-run bind labels→agent names automatically",
-        flush=True,
-    )
+    print(format_turn_init_usage(names), flush=True)
     return 0
 
 

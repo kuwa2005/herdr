@@ -3321,6 +3321,14 @@ class TurnInitTests(unittest.TestCase):
         self.assertIn("--participant a", hint)
         self.assertIn("--participant b", hint)
 
+    def test_format_turn_init_usage(self) -> None:
+        usage = turns.format_turn_init_usage(["boss", "agent-a", "agent-b"])
+        self.assertIn("使い方:", usage)
+        self.assertIn('/turn-run 3,"目的"', usage)
+        self.assertIn("NEXT: <agent-a|agent-b>", usage)
+        self.assertIn("ROLE:", usage)
+        self.assertIn("/auto-yes", usage)
+
 
 
 
