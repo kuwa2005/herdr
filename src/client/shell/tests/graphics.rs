@@ -305,6 +305,7 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
             workdir: "/repo".into(),
             goal: TextEditor::default(),
             turns: TextEditor::new("5", true),
+            reports: TextEditor::new("3", true),
             focused: ClientStartTurnsField::Goal,
             error: None,
             starting: false,

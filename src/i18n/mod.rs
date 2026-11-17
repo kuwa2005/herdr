@@ -69,7 +69,9 @@ pub enum Msg {
     CtxSendRightClicksToPane,
     CtxStartTurns,
     CtxTurnInit,
+    CtxTurnSpawn,
     CtxHubTurnRun,
+    CtxHubTurnStop,
     CtxClosePane,
 }
 
@@ -137,7 +139,9 @@ fn en(msg: Msg) -> &'static str {
         Msg::CtxSendRightClicksToPane => "Send right-clicks to pane",
         Msg::CtxStartTurns => "Start self-evolve loop...",
         Msg::CtxTurnInit => "Initialize turn grid",
+        Msg::CtxTurnSpawn => "Start turns with a team...",
         Msg::CtxHubTurnRun => "Start hub turns...",
+        Msg::CtxHubTurnStop => "Stop hub turns",
         Msg::CtxClosePane => "Close pane",
     }
 }
@@ -197,7 +201,9 @@ fn ja(msg: Msg) -> Option<&'static str> {
         Msg::CtxSendRightClicksToPane => "右クリックをペインに送る",
         Msg::CtxStartTurns => "自己進化ループ...",
         Msg::CtxTurnInit => "ターン制を初期化",
+        Msg::CtxTurnSpawn => "ターン制を開始...",
         Msg::CtxHubTurnRun => "ターン開始...",
+        Msg::CtxHubTurnStop => "ターン停止",
         Msg::CtxClosePane => "ペインを閉じる",
     })
 }
@@ -257,7 +263,9 @@ fn zh_cn(msg: Msg) -> Option<&'static str> {
         Msg::CtxSendRightClicksToPane => "将右键发送到窗格",
         Msg::CtxStartTurns => "自我进化循环...",
         Msg::CtxTurnInit => "初始化回合网格",
+        Msg::CtxTurnSpawn => "组建团队并开始回合...",
         Msg::CtxHubTurnRun => "开始回合...",
+        Msg::CtxHubTurnStop => "停止回合",
         Msg::CtxClosePane => "关闭窗格",
     })
 }
@@ -275,12 +283,15 @@ mod tests {
             Msg::CtxClosePane,
             Msg::CtxStartTurns,
             Msg::CtxTurnInit,
+            Msg::CtxTurnSpawn,
             Msg::CtxHubTurnRun,
+            Msg::CtxHubTurnStop,
         ] {
             assert!(!t(UiLanguage::En, msg).is_empty());
         }
         assert_eq!(t(UiLanguage::Ja, Msg::CtxTurnInit), "ターン制を初期化");
         assert_eq!(t(UiLanguage::Ja, Msg::CtxHubTurnRun), "ターン開始...");
+        assert_eq!(t(UiLanguage::Ja, Msg::CtxTurnSpawn), "ターン制を開始...");
         assert_eq!(t(UiLanguage::ZhCn, Msg::CtxTurnInit), "初始化回合网格");
     }
 

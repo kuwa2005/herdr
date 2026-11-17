@@ -1498,6 +1498,9 @@ impl ClientShellState {
                     } else if super::contains(self.hits.start_turns_turns, point) {
                         self.focus_start_turns_field(ClientStartTurnsField::Turns);
                         outcome.repaint = true;
+                    } else if super::contains(self.hits.start_turns_reports, point) {
+                        self.focus_start_turns_field(ClientStartTurnsField::Reports);
+                        outcome.repaint = true;
                     } else if let Some((_, index)) = self
                         .hits
                         .worktree_rows

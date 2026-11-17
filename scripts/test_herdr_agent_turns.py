@@ -3948,8 +3948,58 @@ class LeaderHubOrgAndScheduleTests(unittest.TestCase):
             turns.HubAssignment("c", "dev.bugfix", "f", mode="write"),
             turns.HubAssignment("b", "qa.review", "r", mode="read"),
         ]
-        with self.assertRaises(RuntimeError):
-            self._run_wave_with_tracking(wave, fail_on="a")
+        results, events, _, _ = self._run_wave_with_tracking(wave, fail_on="a")
+        by_worker = {a.worker: text for a, text in results}
+        self.assertTrue(by_worker["a"].startswith("(FAILED: RuntimeError: boom a)"))
+        self.assertTrue(by_worker["c"].startswith("(SKIPPED"))
+        self.assertEqual(by_worker["b"], "screen-b")
+        self.assertNotIn(("start", "c"), events)
+        self.assertTrue(turns.hub_result_failed(by_worker["c"]))
+
+    def test_wave_stop_request_propagates(self) -> None:
+        wave = [
+            turns.HubAssignment("a", "dev.implement", "i", mode="write"),
+            turns.HubAssignment("b", "qa.review", "r", mode="read"),
+        ]
+
+        def stop(*args, **kwargs):
+            raise turns.HubStopRequested("stop")
+
+        with mock.patch.object(turns, "prompt_and_wait", side_effect=stop), \
+                mock.patch.object(turns, "agent_read_text", return_value="x"):
+            with self.assertRaises(turns.HubStopRequested):
+                turns.run_hub_assignment_wave(
+                    herdr="herdr", assignments=wave,
+                    build_prompt=lambda a: "p", timeout_ms=10, dry_run=False,
+                )
+
+    def test_wave_prefers_fresh_report_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {w: Path(tmp) / f"{w}_REPORT.md" for w in ("a", "b")}
+            stale = paths["b"]
+            stale.write_text("stale report", encoding="utf-8")
+
+            def fake_prompt(herdr, target, text, *, timeout_ms, env=None, poll_seconds=1.0):
+                if target == "a":
+                    paths["a"].write_text("RESULT: done A", encoding="utf-8")
+
+            wave = [
+                turns.HubAssignment("a", "dev.implement", "i", mode="write"),
+                turns.HubAssignment("b", "qa.review", "r", mode="read"),
+            ]
+            with mock.patch.object(turns, "prompt_and_wait", side_effect=fake_prompt), \
+                    mock.patch.object(turns, "agent_read_text", return_value="screen-b"):
+                results = turns.run_hub_assignment_wave(
+                    herdr="herdr", assignments=wave, build_prompt=lambda a: "p",
+                    timeout_ms=10, dry_run=False,
+                    report_path_for=lambda a: paths[a.worker],
+                )
+            by_worker = {a.worker: text for a, text in results}
+            self.assertIn("RESULT: done A", by_worker["a"])
+            # Stale report is deleted before prompting → screen fallback.
+            self.assertIn("no report file", by_worker["b"])
+            self.assertIn("screen-b", by_worker["b"])
+            self.assertFalse(stale.exists())
 
     def test_wave_summary_caps_each_member(self) -> None:
         results = [
@@ -4057,7 +4107,7 @@ class LeaderHubOrgAndScheduleTests(unittest.TestCase):
             turns, "agent_read_text", side_effect=fake_read
         ), mock.patch.object(
             turns, "map_hub_slots_to_panes", side_effect=RuntimeError("no panes")
-        ):
+        ), mock.patch.object(turns, "notify_herdr"):
             notes = Path(tmp)
             code = turns.run_leader_hub_turns(
                 args, workdir=Path(tmp), notes_dir=notes, start_turn=1,
@@ -4073,11 +4123,56 @@ class LeaderHubOrgAndScheduleTests(unittest.TestCase):
         worker_prompts = {t: p for t, p in prompts if t != "boss"}
         self.assertIn("MODE: write", worker_prompts["a"])
         self.assertIn("READ-ONLY", worker_prompts["b"])
+        self.assertIn("TURN1_WORKER_a_STEP1_REPORT.md", worker_prompts["a"])
+        leader_prompts = [p for t, p in prompts if t == "boss"]
+        self.assertIn("--- Org chart", leader_prompts[0])
+        self.assertNotIn("--- Org chart", leader_prompts[1])
+        self.assertIn("dev.implement(W)", leader_prompts[1])
         second_leader = [p for t, p in prompts if t == "boss"][1]
         self.assertIn("a finished", second_leader)
         self.assertIn("b finished", second_leader)
 
-    def test_run_leader_hub_turns_writes_log_on_timeout(self) -> None:
+    def test_run_leader_hub_turns_worker_timeout_goes_to_leader(self) -> None:
+        prompts: list[tuple[str, str]] = []
+        replies = [
+            "HUB-DIRECTIVE T1-S1\nNEXT: a\nROLE: dev.implement\nINSTRUCTION: x\n",
+            "HUB-DIRECTIVE T1-S2\nSTATUS: STOP\n",
+        ]
+
+        def fake_prompt(herdr, target, text, *, timeout_ms, env=None, poll_seconds=1.0):
+            prompts.append((target, text))
+            if target == "a":
+                raise TimeoutError("slow")
+
+        def fake_read(herdr, target, **kwargs):
+            return replies.pop(0) if target == "boss" else "partial work"
+
+        args = argparse.Namespace(
+            herdr="herdr", dry_run=False, goal="g", timeout_ms=1000,
+            steps_per_turn=2, acceptance=None,
+        )
+        route = turns.LeaderHubRoute(leader="boss", workers=["a"], order=["a"])
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            turns, "prompt_and_wait", side_effect=fake_prompt
+        ), mock.patch.object(turns, "agent_read_text", side_effect=fake_read), \
+                mock.patch.object(
+                    turns, "map_hub_slots_to_panes", side_effect=RuntimeError("no panes")
+                ), mock.patch.object(turns, "notify_herdr") as notify:
+            notes = Path(tmp)
+            code = turns.run_leader_hub_turns(
+                args, workdir=Path(tmp), notes_dir=notes, start_turn=1,
+                end_turn=1, route=route,
+            )
+            self.assertEqual(code, 0)
+            log = (notes / "TURN1_HUB.md").read_text(encoding="utf-8")
+            self.assertIn("WORKER_FAILED `a`", log)
+            self.assertFalse((notes / turns.HUB_PID_NAME).exists())
+        second_leader = [p for t, p in prompts if t == "boss"][1]
+        self.assertIn("(FAILED: TimeoutError: slow)", second_leader)
+        self.assertIn("partial work", second_leader)
+        notify.assert_called()
+
+    def test_run_leader_hub_turns_writes_log_on_leader_timeout(self) -> None:
         def fake_prompt(herdr, target, text, *, timeout_ms, env=None, poll_seconds=1.0):
             if target == "a":
                 raise TimeoutError("slow")
@@ -4098,13 +4193,20 @@ class LeaderHubOrgAndScheduleTests(unittest.TestCase):
             turns, "map_hub_slots_to_panes", side_effect=RuntimeError("no panes")
         ):
             notes = Path(tmp)
-            with self.assertRaises(TimeoutError):
-                turns.run_leader_hub_turns(
-                    args, workdir=Path(tmp), notes_dir=notes, start_turn=1,
-                    end_turn=1, route=route,
-                )
+            with mock.patch.object(turns, "notify_herdr") as notify, \
+                    mock.patch.object(
+                        turns, "agent_read_text",
+                        side_effect=TimeoutError("leader slow"),
+                    ):
+                with self.assertRaises(TimeoutError):
+                    turns.run_leader_hub_turns(
+                        args, workdir=Path(tmp), notes_dir=notes, start_turn=1,
+                        end_turn=1, route=route,
+                    )
             log = (notes / "TURN1_HUB.md").read_text(encoding="utf-8")
-            self.assertIn("## Step 1", log)
+            self.assertIn("Turn 1 leader hub", log)
+            self.assertIn("エラー", notify.call_args[0][1])
+            self.assertFalse((notes / turns.HUB_PID_NAME).exists())
 
 
 class AgentSafetyTests(unittest.TestCase):
@@ -4132,6 +4234,235 @@ class AgentSafetyTests(unittest.TestCase):
                 mock.patch.object(turns, "agent_send_keys") as keys:
             self.assertTrue(turns.try_auto_yes_for_target("herdr", "a", force=True))
             keys.assert_called_once_with("herdr", "a", "1", "enter", env=None)
+
+
+class TurnSpawnTests(unittest.TestCase):
+    def test_extract_turn_spawn_argv(self) -> None:
+        self.assertIsNone(turns.extract_turn_spawn_argv(["turn-run", "3,x"]))
+        opts = turns.extract_turn_spawn_argv(
+            [
+                "turn-spawn", '3,"ship it"', "--reports", "5",
+                "--agent-arg=--model", "--agent-arg", "opus",
+                "--notes-dir", "/tmp/n", "--kind=codex", "--dry-run",
+            ]
+        )
+        self.assertEqual(opts["spec"], '3,"ship it"')
+        self.assertEqual(opts["reports"], "5")
+        self.assertEqual(opts["kind"], "codex")
+        self.assertEqual(opts["agent_args"], ["--model", "opus"])
+        self.assertEqual(opts["notes_dir"], Path("/tmp/n"))
+        self.assertTrue(opts["dry_run"])
+
+    def test_reports_and_default_args(self) -> None:
+        self.assertEqual(turns.parse_turn_spawn_reports(None), 3)
+        self.assertEqual(turns.parse_turn_spawn_reports("7"), 7)
+        for bad in ("0", "8", "x"):
+            with self.assertRaises(ValueError):
+                turns.parse_turn_spawn_reports(bad)
+        self.assertEqual(turns.hub_spawn_agent_args("cursor", None), ["--yolo"])
+        self.assertEqual(
+            turns.hub_spawn_agent_args("claude", []), ["--dangerously-skip-permissions"]
+        )
+        self.assertEqual(turns.hub_spawn_agent_args("opencode", None), [])
+        self.assertEqual(turns.hub_spawn_agent_args("codex", None), ["--full-auto"])
+        self.assertEqual(turns.hub_spawn_agent_args("claude", ["--x"]), ["--x"])
+
+    def test_start_report_agent_retries_busy_shell_only(self) -> None:
+        calls: list[list[str]] = []
+        outcomes = [RuntimeError("target_busy: pane busy"), None]
+
+        def fake_json(herdr, cmd, env=None):
+            calls.append(cmd)
+            outcome = outcomes.pop(0)
+            if outcome:
+                raise outcome
+            return {}
+
+        with mock.patch.object(turns, "herdr_json", side_effect=fake_json), \
+                mock.patch.object(turns.time, "sleep"):
+            turns.start_report_agent(
+                "herdr", name="agent-a", kind="claude", pane_id="p2",
+                agent_args=["--dangerously-skip-permissions"],
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[0][-2:], ["--", "--dangerously-skip-permissions"]
+        )
+        self.assertIn("--timeout", calls[0])
+        with mock.patch.object(
+            turns, "herdr_json", side_effect=RuntimeError("timed out waiting")
+        ) as hj, mock.patch.object(turns.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                turns.start_report_agent(
+                    "herdr", name="agent-a", kind="claude", pane_id="p2", agent_args=[]
+                )
+            self.assertEqual(hj.call_count, 1)
+
+    def _run_spawn(self, *, start_side_effect=None, agent_kind="claude", panes_before=1):
+        layouts = [
+            [{"pane_id": f"p{i}", "rect": {"x": 0, "y": i}} for i in range(1, panes_before + 1)],
+            [
+                {"pane_id": "p1", "rect": {"x": 0, "y": 0}},
+                {"pane_id": "p2", "rect": {"x": 10, "y": 0}},
+                {"pane_id": "p3", "rect": {"x": 0, "y": 5}},
+                {"pane_id": "p4", "rect": {"x": 10, "y": 5}},
+            ],
+        ]
+        started: list[tuple[str, str, str, list[str]]] = []
+
+        def fake_start(herdr, *, name, kind, pane_id, agent_args, env=None):
+            if start_side_effect:
+                start_side_effect(name)
+            started.append((name, kind, pane_id, list(agent_args)))
+
+        agents = {"p1": {"agent": agent_kind}} if agent_kind else {}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"HERDR_PANE_ID": "p1"}
+        ), mock.patch.object(
+            turns, "list_current_tab_panes_visual", side_effect=lambda *a, **k: layouts.pop(0)
+        ), mock.patch.object(
+            turns, "list_agents_by_pane", return_value=agents
+        ), mock.patch.object(turns, "split_tab_for_turn_init") as split, \
+                mock.patch.object(turns, "herdr_run") as run, \
+                mock.patch.object(turns, "try_agent_rename") as rename, \
+                mock.patch.object(turns, "start_report_agent", side_effect=fake_start), \
+                mock.patch.object(
+                    turns, "resolve_hub_targets_from_current_tab",
+                    return_value=("boss", ["agent-a", "agent-b", "agent-c"]),
+                ), mock.patch.object(turns, "main", return_value=0) as main, \
+                mock.patch.object(turns, "notify_herdr") as notify:
+            code = turns.run_turn_spawn(
+                herdr="herdr", spec_raw='2,"goal"', reports_raw="3",
+                notes_dir=Path(tmp) / "notes",
+            )
+            log = (Path(tmp) / "notes" / turns.TURN_SPAWN_LOG_NAME)
+            log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+        self.last_notify = notify
+        return code, split, run, rename, started, main, log_text
+
+    def test_run_turn_spawn_splits_starts_same_kind_and_runs_hub(self) -> None:
+        code, split, run, rename, started, main, log = self._run_spawn()
+        self.assertEqual(code, 0)
+        split.assert_called_once()
+        self.assertEqual(split.call_args[0][2], 4)
+        renamed = [c[0][1][3] for c in run.call_args_list]
+        self.assertEqual(renamed, ["boss", "agent-a", "agent-b", "agent-c"])
+        rename.assert_called_once_with("herdr", "p1", "boss", env=None)
+        self.assertEqual(
+            sorted(started),
+            [
+                ("agent-a", "claude", "p2", ["--dangerously-skip-permissions"]),
+                ("agent-b", "claude", "p3", ["--dangerously-skip-permissions"]),
+                ("agent-c", "claude", "p4", ["--dangerously-skip-permissions"]),
+            ],
+        )
+        argv = main.call_args[0][0]
+        self.assertIn("--daemon", argv)
+        self.assertEqual(argv[:2], ["--leader", "boss"])
+        self.assertIn("starting hub", log)
+
+    def test_run_turn_spawn_stops_when_a_report_fails(self) -> None:
+        def fail_b(name):
+            if name == "agent-b":
+                raise RuntimeError("agent start agent-b failed: timed out")
+
+        code, _, run, _, _, main, log = self._run_spawn(start_side_effect=fail_b)
+        self.assertEqual(code, 1)
+        main.assert_not_called()
+        self.assertIn("agent-b", log)
+        closed = [c[0][1] for c in run.call_args_list if c[0][1][:2] == ["pane", "close"]]
+        self.assertEqual([c[2] for c in closed], ["p2", "p3", "p4"])
+        self.assertEqual(
+            self.last_notify.call_args[0][1], "ターン制を開始できませんでした"
+        )
+
+    def test_run_turn_spawn_requires_agent_and_single_pane(self) -> None:
+        code, split, *_rest, log = self._run_spawn(agent_kind=None)
+        self.assertEqual(code, 2)
+        split.assert_not_called()
+        self.assertIn("no AI agent detected", log)
+        code, split, *_ = self._run_spawn(panes_before=2)
+        self.assertEqual(code, 2)
+        split.assert_not_called()
+
+
+class HubStopAndSnapshotTests(unittest.TestCase):
+    def test_turn_stop_signals_recorded_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp)
+            with mock.patch.object(turns, "notify_herdr"):
+                self.assertEqual(turns.run_turn_stop(herdr="herdr", notes_dir=notes), 1)
+                (notes / turns.HUB_PID_NAME).write_text('{"pid": 4242}', encoding="utf-8")
+                with mock.patch.object(turns, "_pid_runs_turns_runner", return_value=True), \
+                        mock.patch.object(turns.os, "kill") as kill:
+                    self.assertEqual(
+                        turns.run_turn_stop(herdr="herdr", notes_dir=notes), 0
+                    )
+                kill.assert_called_once_with(4242, turns.signal.SIGTERM)
+                with mock.patch.object(turns, "_pid_runs_turns_runner", return_value=False):
+                    self.assertEqual(
+                        turns.run_turn_stop(herdr="herdr", notes_dir=notes), 1
+                    )
+                self.assertFalse((notes / turns.HUB_PID_NAME).exists())
+
+    def test_hub_pid_roundtrip_only_clears_own_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp)
+            turns.write_hub_pid(notes, leader="boss")
+            turns.clear_hub_pid(notes)
+            self.assertFalse((notes / turns.HUB_PID_NAME).exists())
+            (notes / turns.HUB_PID_NAME).write_text('{"pid": 1}', encoding="utf-8")
+            turns.clear_hub_pid(notes)
+            self.assertTrue((notes / turns.HUB_PID_NAME).exists())
+
+    def test_prompt_and_wait_honors_stop_flag(self) -> None:
+        turns._HUB_STOP.set()
+        try:
+            with mock.patch.object(turns, "prepare_agent"), \
+                    mock.patch.object(turns, "herdr_json"), \
+                    mock.patch.object(turns, "agent_status", return_value="working"):
+                with self.assertRaises(turns.HubStopRequested):
+                    turns.prompt_and_wait("herdr", "a", "x", timeout_ms=5000)
+        finally:
+            turns._HUB_STOP.clear()
+
+    def test_reader_snapshot_includes_uncommitted_and_untracked(self) -> None:
+        import shutil as _shutil
+        import subprocess as _sp
+
+        if _shutil.which("git") is None:
+            self.skipTest("git not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+            run = lambda *a: _sp.run(["git", "-C", str(repo), *a], check=True,
+                                     capture_output=True, env=env)
+            run("init", "-q")
+            (repo / "tracked.txt").write_text("v1", encoding="utf-8")
+            (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-q", "-m", "init")
+            (repo / "tracked.txt").write_text("v2-uncommitted", encoding="utf-8")
+            (repo / "new.txt").write_text("untracked", encoding="utf-8")
+            (repo / "ignored.txt").write_text("secret-ish", encoding="utf-8")
+            snap = turns.create_reader_snapshot(repo, "T1-S1-test")
+            try:
+                self.assertIsNotNone(snap)
+                view = snap.workdir_view
+                self.assertEqual((view / "tracked.txt").read_text(), "v2-uncommitted")
+                self.assertEqual((view / "new.txt").read_text(), "untracked")
+                self.assertFalse((view / "ignored.txt").exists())
+                # Working tree and stash list untouched.
+                self.assertEqual((repo / "tracked.txt").read_text(), "v2-uncommitted")
+                stash = _sp.run(["git", "-C", str(repo), "stash", "list"],
+                                capture_output=True, text=True).stdout
+                self.assertEqual(stash.strip(), "")
+            finally:
+                turns.remove_reader_snapshot(snap)
+            self.assertFalse(snap.worktree.exists())
+            self.assertIsNone(turns.create_reader_snapshot(Path(tmp), "x"))
 
 
 if __name__ == "__main__":

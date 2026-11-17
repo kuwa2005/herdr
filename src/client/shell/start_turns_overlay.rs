@@ -9,7 +9,9 @@ pub(super) fn render_start_turns_overlay(
     let title_msg = match start.mode {
         ClientStartTurnsMode::FromHere => crate::i18n::Msg::CtxStartTurns,
         ClientStartTurnsMode::LeaderHub => crate::i18n::Msg::CtxHubTurnRun,
+        ClientStartTurnsMode::Spawn => crate::i18n::Msg::CtxTurnSpawn,
     };
+    let spawn = start.mode == ClientStartTurnsMode::Spawn;
     let title = crate::i18n::t(language, title_msg)
         .trim_end_matches("...")
         .trim_end_matches('…');
@@ -68,6 +70,34 @@ pub(super) fn render_start_turns_overlay(
         &start.turns,
         Style::default().fg(p.text).bg(turns_bg),
     );
+    // Spawn mode: report count next to turns (same AI kind as this pane).
+    let reports_x = inner.x.saturating_add(20);
+    let (reports, reports_cursor) = if spawn && inner.width > 34 {
+        put_text(
+            b,
+            reports_x,
+            inner.y + 5,
+            inner.width.saturating_sub(20),
+            " reports (1-7, same AI as this pane)",
+            Style::default().fg(p.overlay0).bg(p.panel_bg),
+        );
+        let reports = Rect::new(reports_x, inner.y + 6, 12, 1);
+        let reports_bg = if start.focused == ClientStartTurnsField::Reports {
+            p.surface0
+        } else {
+            p.panel_bg
+        };
+        b.set_style(reports, Style::default().fg(p.text).bg(reports_bg));
+        let cursor = text_editor::render(
+            b,
+            Rect::new(reports.x + 1, reports.y, reports.width.saturating_sub(1), 1),
+            &start.reports,
+            Style::default().fg(p.text).bg(reports_bg),
+        );
+        (reports, cursor)
+    } else {
+        (Rect::default(), None)
+    };
     put_text(
         b,
         inner.x,
@@ -132,6 +162,7 @@ pub(super) fn render_start_turns_overlay(
         match start.focused {
             ClientStartTurnsField::Goal => goal_cursor,
             ClientStartTurnsField::Turns => turns_cursor,
+            ClientStartTurnsField::Reports => reports_cursor,
         }
     };
     Some(OverlayRender {
@@ -141,6 +172,7 @@ pub(super) fn render_start_turns_overlay(
         cancel: *cancel,
         start_turns_goal: goal,
         start_turns_turns: turns,
+        start_turns_reports: reports,
         cursor,
         ..OverlayRender::default()
     })

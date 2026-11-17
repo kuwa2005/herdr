@@ -121,6 +121,7 @@ pub(super) struct ShellHitMap {
     pub(super) overlay_cancel: Rect,
     pub(super) start_turns_goal: Rect,
     pub(super) start_turns_turns: Rect,
+    pub(super) start_turns_reports: Rect,
     pub(super) navigator_popup: Rect,
     pub(super) navigator_search: Rect,
     pub(super) navigator_rows: Vec<(Rect, ClientNavigatorTarget)>,
@@ -444,6 +445,8 @@ pub(super) struct ClientWorktreeCreateOverlay {
 pub(super) enum ClientStartTurnsField {
     Goal,
     Turns,
+    /// Report count; only shown for ``ClientStartTurnsMode::Spawn``.
+    Reports,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,6 +457,9 @@ pub(super) enum ClientStartTurnsMode {
     FromHere,
     /// Leader-hub via ``herdr-turns turn-run`` (no slash commands).
     LeaderHub,
+    /// Single pane with a running agent: split, start the same agent kind in
+    /// N report panes, then run the leader hub (``herdr-turns turn-spawn``).
+    Spawn,
 }
 
 #[derive(Debug)]
@@ -463,6 +469,7 @@ pub(super) struct ClientStartTurnsOverlay {
     pub(super) mode: ClientStartTurnsMode,
     pub(super) goal: TextEditor,
     pub(super) turns: TextEditor,
+    pub(super) reports: TextEditor,
     pub(super) focused: ClientStartTurnsField,
     pub(super) error: Option<String>,
     pub(super) starting: bool,
@@ -564,7 +571,9 @@ pub(super) enum ClientContextMenuAction {
     #[allow(dead_code)]
     StartTurns,
     TurnInit,
+    TurnSpawn,
     HubTurnRun,
+    HubTurnStop,
     ClosePane,
 }
 
@@ -590,6 +599,8 @@ pub(super) enum ClientContextMenuTarget {
         right_click_passthrough: bool,
         single_pane_tab: bool,
         is_hub_leader: bool,
+        /// A detected agent runs in this pane (enables turn-spawn).
+        has_agent: bool,
     },
 }
 

@@ -43,6 +43,10 @@ Manual multi-party (2–4 already-running named agents, no nest/split):
   ``boss,agent-a,agent-b,agent-c``; ``turn-init 6`` for a 6-pane grid, up
   to 8) only on a **single-pane** tab; it splits to a two-row grid then
   renames panes in visual order.
+* **Spawn team**: from a single pane already running an agent,
+  ``herdr-turns turn-spawn 3,"goal" --reports N`` splits the tab, starts the
+  same agent kind in N report panes (per-kind default args), then runs the
+  hub. The pane menu's 「ターン制を開始...」 calls this.
 * **Run hub**: from the leader pane, ``herdr-turns /turn-run 3,"goal"``
   (or ``turn-run 3,"goal"``) starts the leader-hub loop (daemon) using
   the current pane as ``--leader`` and other tab targets as
@@ -67,8 +71,11 @@ import json
 import os
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -347,6 +354,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Without --leader: among all --participant names. "
             "Every listed name in the active set must appear at least once; "
             "unknown names are rejected"
+        ),
+    )
+    p.add_argument(
+        "--no-reader-snapshot",
+        dest="reader_snapshot",
+        action="store_false",
+        help=(
+            "With --leader: let read-only reports inspect the live workdir "
+            "instead of a git-worktree snapshot while a writer runs"
         ),
     )
     p.add_argument(
@@ -1047,6 +1063,15 @@ def format_hub_org_chart() -> str:
     return "\n".join(lines)
 
 
+def format_hub_org_keys() -> str:
+    """One-line key list with write duties marked (compact briefing)."""
+    parts = [
+        f"{spec.key}{'(W)' if spec.mode == HUB_MODE_WRITE else ''}"
+        for spec in HUB_ROLE_CATALOG
+    ]
+    return ", ".join(parts) + " — (W)=write/serial, others read/parallel"
+
+
 def hub_directive_marker(turn: int, step: int) -> str:
     """Per-step reply marker so stale replies / echoed prompts are skipped."""
     return f"{HUB_DIRECTIVE_MARKER_PREFIX} T{turn}-S{step}"
@@ -1531,14 +1556,27 @@ def leader_briefing_prompt(
     last_output: str,
     acceptance: str | None = None,
     marker: str | None = None,
+    include_org_chart: bool = True,
 ) -> str:
-    """Ask the leader to choose NEXT / ROLE / MODE / INSTRUCTION / STATUS."""
+    """Ask the leader to choose NEXT / ROLE / MODE / INSTRUCTION / STATUS.
+
+    The full org chart is sent on the first step of each turn; later steps
+    carry only the key list to keep the leader's context small.
+    """
     workers_s = ", ".join(route.workers)
     order_s = " → ".join(route.order)
     known = ", ".join([route.leader, *route.workers])
     acc = format_acceptance_block(acceptance)
     last_label = last_agent or "(none)"
     marker_s = marker or hub_directive_marker(turn, step)
+    if include_org_chart:
+        org_chart = (
+            "--- Org chart (put the key in ROLE, e.g. qa.review) ---\n"
+            f"{format_hub_org_chart()}\n"
+            "--- end org chart ---\n"
+        )
+    else:
+        org_chart = f"Org chart keys (details sent at step 1): {format_hub_org_keys()}\n"
     return (
         f"Turn {turn}/{turns} LEADER HUB (step {step}/{steps}).\n"
         f"You are the leader agent `{route.leader}` — run your reports like "
@@ -1556,9 +1594,7 @@ def leader_briefing_prompt(
         f"(Unknown NEXT outside the report pool gets one retry, then "
         f"fails — no default fallback.)\n"
         f"Last report(s): {last_label}\n"
-        f"--- Org chart (put the key in ROLE, e.g. qa.review) ---\n"
-        f"{format_hub_org_chart()}\n"
-        f"--- end org chart ---\n"
+        f"{org_chart}"
         f"Scheduling rules (enforced by the runner):\n"
         f"- One NEXT block per report; several blocks (or NEXT: a, b) form a "
         f"wave that starts together.\n"
@@ -1574,6 +1610,9 @@ def leader_briefing_prompt(
         f"following task.\n"
         f"- Do not split one coding change across several writers in the same "
         f"wave.\n"
+        f"- Evidence starting with (FAILED …) or (SKIPPED …) means that report "
+        f"did not finish (timeout/error, or an earlier writer failed): "
+        f"reassign, split the task, or STOP.\n"
         f"Reply format — the first line must be `{marker_s}` on its own line "
         f"(the runner finds your reply by it), then one block per report:\n"
         f"  NEXT: <slot name>\n"
@@ -1655,14 +1694,23 @@ def format_prior_worker_section(
     )
 
 
-def _hub_mode_guidance(mode: str | None) -> str:
+def _hub_mode_guidance(mode: str | None, *, snapshot_path: Path | None = None) -> str:
     if mode == HUB_MODE_READ:
+        where = (
+            f"Inspect the SNAPSHOT at {snapshot_path} — a copy of the workdir "
+            "taken when this step started (includes uncommitted changes); the "
+            "workdir itself is being edited right now. Map workdir paths into "
+            "the snapshot. Do not edit the snapshot either; builds/tests may "
+            "run inside it.\n"
+            if snapshot_path is not None
+            else "Review/verify the state that was already implemented (see "
+            "prior handoff); running builds/tests is OK.\n"
+        )
         return (
             "MODE: read — READ-ONLY duty. Do NOT create, edit, delete, format "
             "or git-modify files in the workdir (another report may be editing "
-            "right now). Review/verify the state that was already implemented "
-            "(see prior handoff), run builds/tests if useful, and report "
-            "findings for the leader.\n"
+            "right now). The only file you may write is your report file.\n"
+            + where
         )
     if mode == HUB_MODE_WRITE:
         return (
@@ -1689,12 +1737,14 @@ def worker_assignment_prompt(
     prior_role: str | None = None,
     prior_summary: str | None = None,
     mode: str | None = None,
+    report_path: Path | None = None,
+    snapshot_path: Path | None = None,
 ) -> str:
     """Forward the leader's instruction to a worker agent.
 
     Includes an explicit prior-worker handoff section (none on step 1;
-    report name / ROLE / summary on later steps) and, when known, the
-    read/write scheduling contract for this assignment.
+    report name / ROLE / summary on later steps), the read/write scheduling
+    contract, and (when given) the report file the runner reads back.
     """
     role_s = normalize_hub_role(role)
     if role_s:
@@ -1719,17 +1769,28 @@ def worker_assignment_prompt(
         prior_role=prior_role,
         prior_summary=prior_summary,
     )
+    if report_path is not None:
+        finish = (
+            f"When done, write your report for the leader to {report_path} "
+            f"(markdown: result, files changed, verification run and outcome, "
+            f"open issues). The runner reads that file, not your screen. "
+            f"Do not commit unless asked.\n"
+        )
+    else:
+        finish = (
+            "Do that work in this pane. When done, leave a clear on-screen "
+            "summary for the leader. Do not commit unless asked.\n"
+        )
     return (
         f"Turn {turn}/{turns} REPORT assignment "
         f"(step {step}/{steps} → you are `{worker}`).\n"
         f"{role_line}"
-        f"{_hub_mode_guidance(mode)}"
+        f"{_hub_mode_guidance(mode, snapshot_path=snapshot_path)}"
         f"Workdir: {workdir}\n"
         f"Overall goal: {goal}\n"
         f"{handoff}"
         f"INSTRUCTION:\n{instruction.strip()}\n"
-        f"Do that work in this pane. When done, leave a clear on-screen summary "
-        f"for the leader. Do not commit unless asked.\n"
+        f"{finish}"
     )
 
 
@@ -1857,6 +1918,47 @@ def describe_hub_wave_plan(assignments: list[HubAssignment]) -> str:
     return " | ".join(parts) or "(empty)"
 
 
+HUB_WORKER_REPORT_MAX_CHARS = 8_000
+HUB_FAILED_PREFIX = "(FAILED"
+HUB_SKIPPED_PREFIX = "(SKIPPED"
+
+
+class HubStopRequested(BaseException):
+    """Raised when ``turn-stop`` (SIGTERM) asks the hub to stop.
+
+    BaseException so per-worker ``except Exception`` failure handling never
+    swallows it.
+    """
+
+
+_HUB_STOP = threading.Event()
+
+
+def hub_result_failed(text: str | None) -> bool:
+    head = (text or "").lstrip()
+    return head.startswith(HUB_FAILED_PREFIX) or head.startswith(HUB_SKIPPED_PREFIX)
+
+
+def read_worker_report(path: Path | None, *, since: float) -> str | None:
+    """Return a worker's report file written after *since*, else None."""
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    # Small slack for coarse filesystem timestamps.
+    if stat.st_mtime < since - 2:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    return _truncate_chars(text, HUB_WORKER_REPORT_MAX_CHARS)
+
+
 def run_hub_assignment_wave(
     *,
     herdr: str,
@@ -1865,14 +1967,21 @@ def run_hub_assignment_wave(
     timeout_ms: int,
     dry_run: bool,
     env: dict[str, str | None] | None = None,
+    report_path_for=None,
+    tolerate_failures: bool = True,
 ) -> list[tuple[HubAssignment, str]]:
     """Run one hub wave with read/write-aware scheduling.
 
     * ``write`` assignments (or unknown mode) run one after another in the
       listed order — never two editors on the shared workdir at once. If one
-      writer fails, later writers are skipped.
+      writer fails, later writers are skipped (``(SKIPPED …)``).
     * ``read`` assignments all start immediately and run in parallel with
       each other and with the writer chain.
+    * Each result is the worker's report file (``report_path_for``) when it
+      was written during this run, else its screen tail.
+    * With ``tolerate_failures`` (default) a timeout/error becomes a
+      ``(FAILED …)`` result for the leader to handle instead of aborting the
+      whole hub. ``HubStopRequested`` always propagates.
 
     ``build_prompt(assignment) -> str`` builds the worker prompt text.
     Returns results in *assignments* order (not completion order).
@@ -1892,41 +2001,83 @@ def run_hub_assignment_wave(
             )
         return out
 
+    def _collect(assignment: HubAssignment, since: float) -> str:
+        report_path = report_path_for(assignment) if report_path_for else None
+        report = read_worker_report(report_path, since=since)
+        if report is not None:
+            return f"(report: {report_path.name})\n{report}"  # type: ignore[union-attr]
+        try:
+            screen = agent_read_text(herdr, assignment.worker, env=env)
+        except RuntimeError as err:
+            screen = f"(screen unavailable: {err})"
+        if report_path is not None:
+            return f"(no report file; screen tail)\n{screen}"
+        return screen
+
     def _one(assignment: HubAssignment) -> tuple[str, str]:
+        report_path = report_path_for(assignment) if report_path_for else None
+        if report_path is not None:
+            try:
+                report_path.unlink()
+            except OSError:
+                pass
+        since = time.time()
         prompt = build_prompt(assignment)
-        prompt_and_wait(
-            herdr,
-            assignment.worker,
-            prompt,
-            timeout_ms=timeout_ms,
-            env=env,
-        )
-        screen = agent_read_text(herdr, assignment.worker, env=env)
-        return assignment.worker, screen
+        try:
+            prompt_and_wait(
+                herdr,
+                assignment.worker,
+                prompt,
+                timeout_ms=timeout_ms,
+                env=env,
+            )
+        except Exception as err:  # noqa: BLE001 — reported to the leader
+            if not tolerate_failures:
+                raise
+            print(
+                f"warning: hub worker {assignment.worker} failed: {err}",
+                flush=True,
+            )
+            detail = _collect(assignment, since)
+            return (
+                assignment.worker,
+                f"{HUB_FAILED_PREFIX}: {type(err).__name__}: {err})\n{detail}",
+            )
+        return assignment.worker, _collect(assignment, since)
 
     if len(assignments) == 1:
-        _, screen = _one(assignments[0])
-        return [(assignments[0], screen)]
+        _, text = _one(assignments[0])
+        return [(assignments[0], text)]
 
     writers, readers = plan_hub_wave(assignments)
     print(
         f"leader-hub: wave plan → {describe_hub_wave_plan(assignments)}",
         flush=True,
     )
-    screens: dict[str, str] = {}
+    results: dict[str, str] = {}
     errors: list[BaseException] = []
-    screens_lock = threading.Lock()
+    results_lock = threading.Lock()
 
     def _writer_chain() -> None:
+        failed_by: str | None = None
         for assignment in writers:
-            worker, screen = _one(assignment)
-            with screens_lock:
-                screens[worker] = screen
+            if failed_by is not None:
+                with results_lock:
+                    results[assignment.worker] = (
+                        f"{HUB_SKIPPED_PREFIX}: earlier writer `{failed_by}` "
+                        "failed in this wave; not started)"
+                    )
+                continue
+            worker, text = _one(assignment)
+            with results_lock:
+                results[worker] = text
+            if hub_result_failed(text):
+                failed_by = worker
 
     def _reader(assignment: HubAssignment) -> None:
-        worker, screen = _one(assignment)
-        with screens_lock:
-            screens[worker] = screen
+        worker, text = _one(assignment)
+        with results_lock:
+            results[worker] = text
 
     jobs: list[tuple[str, Any, tuple[Any, ...]]] = []
     if writers:
@@ -1947,9 +2098,274 @@ def run_hub_assignment_wave(
                     f"warning: hub wave job {label} failed: {err}",
                     flush=True,
                 )
+    for err in errors:
+        if isinstance(err, HubStopRequested):
+            raise err
     if errors:
         raise errors[0]
-    return [(a, screens[a.worker]) for a in assignments]
+    return [(a, results[a.worker]) for a in assignments]
+
+
+# --- hub helpers: notifications, reader snapshots, pid / stop ---------------
+
+HUB_PID_NAME = "HUB.pid"
+HUB_SNAPSHOT_MAX_UNTRACKED_FILES = 2_000
+HUB_SNAPSHOT_MAX_UNTRACKED_BYTES = 100 * 1024 * 1024
+
+
+def notify_herdr(
+    herdr: str,
+    title: str,
+    body: str | None = None,
+    *,
+    sound: str = "none",
+    env: dict[str, str | None] | None = None,
+) -> None:
+    """Best-effort Herdr toast (``herdr notification show``); never raises."""
+    cmd = [herdr, "notification", "show", title, "--sound", sound]
+    if body:
+        cmd.extend(["--body", _truncate_chars(body, 400)])
+    run_env: dict[str, str] | None = None
+    if env is not None:
+        run_env = os.environ.copy()
+        for key, value in env.items():
+            if value is None:
+                run_env.pop(key, None)
+            else:
+                run_env[key] = value
+    try:
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=run_env,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _git(workdir: Path, *args: str, check: bool = True) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(workdir), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed: {(proc.stderr or proc.stdout).strip()}"
+        )
+    return proc.stdout
+
+
+@dataclass
+class ReaderSnapshot:
+    """Detached git worktree holding the workdir state at a step's start."""
+
+    repo_top: Path
+    worktree: Path
+    workdir_view: Path
+
+
+def _hub_snapshot_root(repo_top: Path) -> Path:
+    digest = hashlib.sha256(str(repo_top).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / "herdr-turns-snapshots" / digest
+
+
+def create_reader_snapshot(workdir: Path, label: str) -> ReaderSnapshot | None:
+    """Snapshot *workdir* (tracked changes + untracked files) for readers.
+
+    Uses ``git stash create`` (does not touch the working tree or stash list)
+    and a detached ``git worktree`` outside the repo, so concurrent readers
+    see a stable tree while the writer edits the real workdir. Returns None
+    when *workdir* is not inside a git repo with at least one commit.
+    """
+    try:
+        top = Path(_git(workdir, "rev-parse", "--show-toplevel").strip())
+        _git(top, "rev-parse", "--verify", "HEAD")
+    except RuntimeError:
+        return None
+    sha = _git(top, "stash", "create", check=False).strip()
+    if not sha:
+        sha = _git(top, "rev-parse", "HEAD").strip()
+    dest = _hub_snapshot_root(top) / label
+    if dest.exists():
+        remove_reader_snapshot(ReaderSnapshot(top, dest, dest))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _git(top, "worktree", "add", "--detach", "--force", str(dest), sha)
+    # Untracked (not ignored) files are not in the stash commit; copy them.
+    listing = _git(top, "ls-files", "--others", "--exclude-standard", "-z", check=False)
+    copied = 0
+    total = 0
+    for rel in [p for p in listing.split("\0") if p]:
+        src = top / rel
+        if not src.is_file():
+            continue
+        try:
+            size = src.stat().st_size
+        except OSError:
+            continue
+        if (
+            copied >= HUB_SNAPSHOT_MAX_UNTRACKED_FILES
+            or total + size > HUB_SNAPSHOT_MAX_UNTRACKED_BYTES
+        ):
+            print(
+                "warning: reader snapshot skipped remaining untracked files "
+                "(size/count cap)",
+                flush=True,
+            )
+            break
+        target = dest / rel
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+        except OSError:
+            continue
+        copied += 1
+        total += size
+    try:
+        view = dest / workdir.resolve().relative_to(top)
+    except ValueError:
+        view = dest
+    return ReaderSnapshot(repo_top=top, worktree=dest, workdir_view=view)
+
+
+def remove_reader_snapshot(snapshot: ReaderSnapshot | None) -> None:
+    if snapshot is None:
+        return
+    proc = subprocess.run(
+        [
+            "git", "-C", str(snapshot.repo_top), "worktree", "remove",
+            "--force", str(snapshot.worktree),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0 and snapshot.worktree.exists():
+        shutil.rmtree(snapshot.worktree, ignore_errors=True)
+    subprocess.run(
+        ["git", "-C", str(snapshot.repo_top), "worktree", "prune"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def write_hub_pid(notes_dir: Path, *, leader: str) -> Path:
+    path = notes_dir / HUB_PID_NAME
+    path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "leader": leader,
+                "started": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def clear_hub_pid(notes_dir: Path) -> None:
+    path = notes_dir / HUB_PID_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if data.get("pid") == os.getpid():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _pid_runs_turns_runner(pid: int) -> bool:
+    """True when *pid* is alive and looks like this runner (not a reused pid)."""
+    if not _pid_is_running(pid):
+        return False
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return True
+    cmdline = proc.stdout or ""
+    return "herdr_agent_turns" in cmdline or "herdr-turns" in cmdline
+
+
+def install_hub_stop_handler() -> Any:
+    """SIGTERM → stop flag (polled by prompt_and_wait) + HubStopRequested.
+
+    Returns the previous handler (pass to ``restore_hub_stop_handler``).
+    """
+    _HUB_STOP.clear()
+
+    def _handler(signum, frame):  # noqa: ARG001
+        _HUB_STOP.set()
+        raise HubStopRequested("stop requested (SIGTERM)")
+
+    try:
+        return signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        # Not in the main thread — the flag still works if set.
+        return None
+
+
+def restore_hub_stop_handler(previous: Any) -> None:
+    if previous is None:
+        return
+    try:
+        signal.signal(signal.SIGTERM, previous)
+    except (ValueError, OSError, TypeError):
+        pass
+
+
+def run_turn_stop(
+    *,
+    herdr: str,
+    notes_dir: Path | None = None,
+) -> int:
+    """Stop the hub whose pid is recorded in ``<notes>/HUB.pid``."""
+    resolved = (
+        notes_dir.expanduser().resolve()
+        if notes_dir is not None
+        else (Path.cwd() / "hub-notes").resolve()
+    )
+    path = resolved / HUB_PID_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        pid = int(data.get("pid"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        print(f"turn-stop: no running hub recorded in {path}", file=sys.stderr)
+        notify_herdr(herdr, "ターン制: 実行中のハブはありません", str(path))
+        return 1
+    if not _pid_runs_turns_runner(pid):
+        print(f"turn-stop: hub pid {pid} is not running; clearing {path}")
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        notify_herdr(herdr, "ターン制: 実行中のハブはありません", str(path))
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as err:
+        print(f"turn-stop: could not signal {pid}: {err}", file=sys.stderr)
+        return 1
+    print(f"turn-stop: sent stop to hub pid {pid}")
+    notify_herdr(
+        herdr,
+        "ターン制を停止しています",
+        "作業中の部下は止まらずに残ります（必要なら各ペインで中断）",
+    )
+    return 0
 
 
 def _write_hub_complete(
@@ -2000,6 +2416,11 @@ def run_leader_hub_turns(
     steps = resolve_hub_steps_per_turn(
         getattr(args, "steps_per_turn", None), len(route.order)
     )
+    use_snapshots = bool(getattr(args, "reader_snapshot", True)) and not args.dry_run
+    previous_sigterm = None
+    if not args.dry_run:
+        previous_sigterm = install_hub_stop_handler()
+        write_hub_pid(notes_dir, leader=route.leader)
 
     print(
         "leader-hub: leader="
@@ -2101,6 +2522,7 @@ def run_leader_hub_turns(
                         last_output=last_output,
                         acceptance=acceptance,
                         marker=marker,
+                        include_org_chart=step_index == 1,
                     )
                     step_leader_path = (
                         notes_dir / f"TURN{turn}_LEADER_STEP{step_index}.md"
@@ -2356,6 +2778,36 @@ def run_leader_hub_turns(
                         f"- schedule ({mode}): {describe_hub_wave_plan(wave)}\n"
                     )
 
+                    # Readers running alongside a writer get a frozen snapshot
+                    # of the step-start state instead of the live workdir.
+                    snapshot: ReaderSnapshot | None = None
+                    if use_snapshots and writers and readers:
+                        try:
+                            snapshot = create_reader_snapshot(
+                                workdir, f"T{turn}-S{step_index}"
+                            )
+                        except (RuntimeError, OSError) as err:
+                            print(
+                                f"warning: reader snapshot failed: {err}",
+                                flush=True,
+                            )
+                            snapshot = None
+                        if snapshot is not None:
+                            steps_log.append(
+                                f"- reader snapshot: `{snapshot.workdir_view}`\n"
+                            )
+
+                    def _report_path(
+                        item: HubAssignment,
+                        *,
+                        _turn: int = turn,
+                        _step: int = step_index,
+                    ) -> Path:
+                        return (
+                            notes_dir
+                            / f"TURN{_turn}_WORKER_{item.worker}_STEP{_step}_REPORT.md"
+                        )
+
                     def _build_prompt(
                         item: HubAssignment,
                         *,
@@ -2364,6 +2816,7 @@ def run_leader_hub_turns(
                         _prior_agent: str | None = prior_agent,
                         _prior_role: str | None = prior_role,
                         _prior_summary: str | None = prior_summary,
+                        _snapshot: ReaderSnapshot | None = snapshot,
                     ) -> str:
                         return worker_assignment_prompt(
                             turn=_turn,
@@ -2380,16 +2833,32 @@ def run_leader_hub_turns(
                             prior_role=_prior_role,
                             prior_summary=_prior_summary,
                             mode=item.mode,
+                            report_path=None if args.dry_run else _report_path(item),
+                            snapshot_path=(
+                                _snapshot.workdir_view
+                                if _snapshot is not None and item.mode == HUB_MODE_READ
+                                else None
+                            ),
                         )
 
-                    wave_results = run_hub_assignment_wave(
-                        herdr=args.herdr,
-                        assignments=wave,
-                        build_prompt=_build_prompt,
-                        timeout_ms=args.timeout_ms,
-                        dry_run=args.dry_run,
-                        env=cli_env,
-                    )
+                    try:
+                        wave_results = run_hub_assignment_wave(
+                            herdr=args.herdr,
+                            assignments=wave,
+                            build_prompt=_build_prompt,
+                            timeout_ms=args.timeout_ms,
+                            dry_run=args.dry_run,
+                            env=cli_env,
+                            report_path_for=None if args.dry_run else _report_path,
+                        )
+                    finally:
+                        remove_reader_snapshot(snapshot)
+                    for item, text in wave_results:
+                        if hub_result_failed(text):
+                            first_line = (text.strip().splitlines() or [""])[0]
+                            steps_log.append(
+                                f"- WORKER_FAILED `{item.worker}`: {first_line}\n"
+                            )
 
                     snap_parts = [
                         f"# Turn {turn} wave step {step_index} ({mode})",
@@ -2458,6 +2927,14 @@ def run_leader_hub_turns(
 
         if stop_reason:
             print(f"leader-hub stopped: {stop_reason}", flush=True)
+            if not args.dry_run:
+                notify_herdr(
+                    args.herdr,
+                    "ターン制が終了しました",
+                    f"{stop_reason} — {notes_dir}",
+                    sound="done",
+                    env=cli_env,
+                )
         else:
             print(
                 f"leader-hub finished turns {start_turn}–{end_turn}",
@@ -2472,9 +2949,41 @@ def run_leader_hub_turns(
                     turns_range=f"{start_turn}-{end_turn}",
                     status="turns-exhausted (leader did not report DONE)",
                 )
+            if not args.dry_run:
+                notify_herdr(
+                    args.herdr,
+                    "ターン制が終了しました",
+                    f"全 {end_turn} ターン完了（リーダーは DONE 未報告） — {notes_dir}",
+                    sound="done",
+                    env=cli_env,
+                )
         if records_notes:
             print("notes: " + "; ".join(records_notes), flush=True)
+    except HubStopRequested:
+        print("leader-hub stopped by turn-stop", flush=True)
+        exit_code = 3
+        if not args.dry_run:
+            notify_herdr(
+                args.herdr,
+                "ターン制を停止しました",
+                f"記録: {notes_dir}",
+                env=cli_env,
+            )
+    except Exception as err:
+        if not args.dry_run:
+            notify_herdr(
+                args.herdr,
+                "ターン制がエラーで止まりました",
+                f"{err} — {notes_dir}/runner.log",
+                sound="request",
+                env=cli_env,
+            )
+        raise
     finally:
+        if not args.dry_run:
+            clear_hub_pid(notes_dir)
+            _HUB_STOP.clear()
+            restore_hub_stop_handler(previous_sigterm)
         if slot_to_pane and not args.dry_run:
             print(
                 "leader-hub: restoring pane labels to slot names",
@@ -4823,6 +5332,8 @@ def prompt_and_wait(
     saw_work = False
     idle_ticks = 0
     while time.monotonic() < deadline:
+        if _HUB_STOP.is_set():
+            raise HubStopRequested(f"stop requested while waiting for {target}")
         status = agent_status(herdr, target, env=env)
         if status in {"working", "blocked"}:
             saw_work = True
@@ -6378,6 +6889,365 @@ def run_turn_run(
 
 
 
+# --- turn-spawn: single pane → N same-kind reports → leader hub ---------------
+
+# Kinds accepted by ``herdr agent start --kind``.
+HUB_SPAWN_SUPPORTED_KINDS = frozenset(
+    {
+        "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline",
+        "omp", "mastracode", "opencode", "copilot", "kimi", "kiro", "droid",
+        "amp", "grok", "hermes", "kilo", "qodercli", "qwen", "letta", "maki",
+        "muse", "oimo",
+    }
+)
+# Per-kind default launch args for spawned reports (skip per-action
+# permission prompts so parallel reports do not stall). Kinds not listed
+# start with no extra args. ``--agent-arg`` replaces these.
+HUB_SPAWN_DEFAULT_AGENT_ARGS: dict[str, list[str]] = {
+    "cursor": ["--yolo"],
+    "claude": ["--dangerously-skip-permissions"],
+    # Sandboxed workspace-write with auto approvals (not a full bypass).
+    "codex": ["--full-auto"],
+    "gemini": ["--yolo"],
+    "qwen": ["--yolo"],
+    "copilot": ["--allow-all-tools"],
+}
+# ``agent start`` readiness wait per report (max allowed by herdr). Long so a
+# first-run trust / mode confirmation can be answered by hand in that pane.
+HUB_SPAWN_START_TIMEOUT_MS = 300_000
+HUB_SPAWN_START_ATTEMPTS = 8
+HUB_SPAWN_RETRY_SLEEP_S = 2.0
+HUB_SPAWN_DEFAULT_REPORTS = 3
+TURN_SPAWN_LOG_NAME = "TURN_SPAWN.log"
+
+
+def hub_spawn_agent_args(kind: str, override: list[str] | None) -> list[str]:
+    """Launch args for spawned reports: explicit override, else kind default."""
+    if override:
+        return list(override)
+    return list(HUB_SPAWN_DEFAULT_AGENT_ARGS.get(kind, []))
+
+
+def detect_pane_agent_kind(
+    herdr: str,
+    pane_id: str,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> str | None:
+    """Detected agent kind running in *pane_id* (``claude``…), else None."""
+    agent = list_agents_by_pane(herdr, [pane_id], env=env).get(pane_id)
+    if agent is None:
+        return None
+    kind = hub_agent_kind(agent)
+    return None if kind == "agent" else kind
+
+
+def start_report_agent(
+    herdr: str,
+    *,
+    name: str,
+    kind: str,
+    pane_id: str,
+    agent_args: list[str],
+    env: dict[str, str | None] | None = None,
+    attempts: int = HUB_SPAWN_START_ATTEMPTS,
+    retry_sleep_s: float = HUB_SPAWN_RETRY_SLEEP_S,
+) -> None:
+    """``agent start`` in a fresh pane, retrying while its shell boots."""
+    cmd = [
+        "agent",
+        "start",
+        name,
+        "--kind",
+        kind,
+        "--pane",
+        pane_id,
+        "--timeout",
+        str(HUB_SPAWN_START_TIMEOUT_MS),
+    ]
+    if agent_args:
+        cmd.extend(["--", *agent_args])
+    last_err: RuntimeError | None = None
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            herdr_json(herdr, cmd, env=env)
+            return
+        except RuntimeError as err:
+            last_err = err
+            text = str(err)
+            # Only a not-yet-ready shell is worth retrying; a timeout means the
+            # agent launched but never became ready (e.g. unanswered dialog).
+            retryable = any(
+                hint in text.lower()
+                for hint in ("busy", "unavailable", "shell", "prompt")
+            ) and "timed out" not in text.lower() and "timeout" not in text.lower()
+            if attempt >= attempts or not retryable:
+                break
+            time.sleep(retry_sleep_s)
+    raise RuntimeError(f"agent start {name} ({kind}) on {pane_id} failed: {last_err}")
+
+
+def parse_turn_spawn_reports(raw: str | int | None) -> int:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return HUB_SPAWN_DEFAULT_REPORTS
+    try:
+        count = int(str(raw).strip())
+    except ValueError as err:
+        raise ValueError(f"turn-spawn --reports must be a number (got {raw!r})") from err
+    if not MIN_HUB_WORKERS <= count <= MAX_HUB_WORKERS:
+        raise ValueError(
+            f"turn-spawn --reports must be {MIN_HUB_WORKERS}–{MAX_HUB_WORKERS} "
+            f"(got {count})"
+        )
+    return count
+
+
+def extract_turn_spawn_argv(argv: list[str]) -> dict[str, Any] | None:
+    """Detect ``turn-spawn``; return parsed options or None.
+
+    ``turn-spawn 3,"goal" [--reports N] [--kind K] [--agent-arg A]...
+    [--notes-dir DIR] [--dry-run]``
+    """
+    if not argv or argv[0] not in {"turn-spawn", "/turn-spawn"}:
+        return None
+    opts: dict[str, Any] = {
+        "spec": "",
+        "reports": None,
+        "kind": None,
+        "agent_args": [],
+        "notes_dir": None,
+        "dry_run": False,
+    }
+    spec_parts: list[str] = []
+    items = list(argv[1:])
+    i = 0
+    while i < len(items):
+        item = items[i]
+        if item in {"--dry-run", "-n"}:
+            opts["dry_run"] = True
+            i += 1
+            continue
+        matched = False
+        for flag, key in (
+            ("--reports", "reports"),
+            ("--kind", "kind"),
+            ("--notes-dir", "notes_dir"),
+            ("--agent-arg", "agent_args"),
+        ):
+            if item == flag and i + 1 < len(items):
+                value = items[i + 1]
+                i += 2
+            elif item.startswith(flag + "="):
+                value = item.split("=", 1)[1]
+                i += 1
+            else:
+                continue
+            if key == "agent_args":
+                opts["agent_args"].append(value)
+            elif key == "notes_dir":
+                opts["notes_dir"] = Path(value)
+            else:
+                opts[key] = value
+            matched = True
+            break
+        if matched:
+            continue
+        spec_parts.append(item)
+        i += 1
+    opts["spec"] = " ".join(spec_parts).strip()
+    return opts
+
+
+def run_turn_spawn(
+    *,
+    herdr: str,
+    spec_raw: str,
+    reports_raw: str | int | None = None,
+    kind: str | None = None,
+    agent_args: list[str] | None = None,
+    notes_dir: Path | None = None,
+    dry_run: bool = False,
+    env: dict[str, str | None] | None = None,
+) -> int:
+    """From a single-pane tab running an AI: add N same-kind reports, run hub.
+
+    1. Require a single-pane tab whose pane (``HERDR_PANE_ID``) runs an agent.
+    2. Split into ``1 + reports`` panes (two-row grid), name them
+       ``boss`` / ``agent-a``…
+    3. Start the leader's agent kind in every new pane (in parallel), with
+       per-kind default args (``HUB_SPAWN_DEFAULT_AGENT_ARGS``) unless
+       ``--agent-arg`` overrides.
+    4. Start the leader hub (daemon) like ``turn-run``.
+
+    Progress and errors are also appended to ``<notes>/TURN_SPAWN.log`` since
+    the pane menu launches this without a visible terminal.
+    """
+    workdir = Path.cwd().resolve()
+    resolved_notes = (
+        notes_dir.expanduser().resolve()
+        if notes_dir is not None
+        else (workdir / "hub-notes").resolve()
+    )
+    log_path: Path | None = None
+    if not dry_run:
+        try:
+            ensure_notes_dir(resolved_notes)
+            log_path = resolved_notes / TURN_SPAWN_LOG_NAME
+        except OSError:
+            log_path = None
+
+    def _log(msg: str, *, error: bool = False) -> None:
+        print(msg, file=sys.stderr if error else sys.stdout, flush=True)
+        if log_path is not None:
+            try:
+                with log_path.open("a", encoding="utf-8") as handle:
+                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    handle.write(f"[{stamp}] {msg}\n")
+            except OSError:
+                pass
+
+    def _fail(msg: str, code: int) -> int:
+        _log(msg, error=True)
+        if not dry_run:
+            where = f" — log: {log_path}" if log_path is not None else ""
+            notify_herdr(
+                herdr,
+                "ターン制を開始できませんでした",
+                f"{msg}{where}",
+                sound="request",
+                env=env,
+            )
+        return code
+
+    try:
+        turns, goal = parse_turn_run_spec(spec_raw)
+        reports = parse_turn_spawn_reports(reports_raw)
+    except ValueError as err:
+        return _fail(str(err), 2)
+
+    pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
+    if not pane_id:
+        return _fail("turn-spawn must run inside a Herdr-managed pane (missing HERDR_PANE_ID)", 2)
+    try:
+        panes = list_current_tab_panes_visual(herdr, env=env)
+        root_pane_id = require_turn_init_single_pane(panes)
+    except (ValueError, RuntimeError) as err:
+        return _fail(f"turn-spawn: {err}", 2)
+    if root_pane_id != pane_id:
+        return _fail(f"turn-spawn: current pane {pane_id} is not this tab's pane "
+            f"({root_pane_id})", 2)
+
+    try:
+        resolved_kind = (kind or "").strip().lower() or detect_pane_agent_kind(
+            herdr, pane_id, env=env
+        )
+    except RuntimeError as err:
+        return _fail(f"turn-spawn: agent list failed: {err}", 1)
+    if not resolved_kind:
+        return _fail("turn-spawn: no AI agent detected in this pane — start the agent "
+            "you want to use (it becomes the leader), then retry", 2)
+    if resolved_kind not in HUB_SPAWN_SUPPORTED_KINDS:
+        return _fail(f"turn-spawn: agent kind {resolved_kind!r} cannot be started "
+            "automatically by `herdr agent start`", 2)
+
+    spawn_args = hub_spawn_agent_args(resolved_kind, agent_args)
+    names = default_turn_init_names(reports + 1)
+    leader_name, report_names = names[0], names[1:]
+    _log(
+        f"turn-spawn: leader={leader_name} ({resolved_kind}) reports="
+        f"{','.join(report_names)} args={' '.join(spawn_args) or '(none)'} "
+        f"turns={turns} notes_dir={resolved_notes}"
+    )
+    if dry_run:
+        _log(
+            f"dry-run: would split into {len(names)} panes, start "
+            f"{resolved_kind} in {len(report_names)} panes, then run the hub"
+        )
+        return 0
+
+    try:
+        split_tab_for_turn_init(herdr, root_pane_id, len(names), env=env)
+        panes = list_current_tab_panes_visual(herdr, env=env)
+        assignments = build_turn_init_assignments(panes, names)
+    except (RuntimeError, ValueError) as err:
+        return _fail(f"turn-spawn: split failed: {err}", 1)
+    if assignments[0][0] != pane_id:
+        return _fail("turn-spawn: leader pane is not top-left after split; aborting", 1)
+
+    for pid, name in assignments:
+        try:
+            herdr_run(herdr, ["pane", "rename", pid, name], env=env, allow_empty=True)
+        except RuntimeError as err:
+            return _fail(f"turn-spawn: pane rename {pid} → {name}: {err}", 1)
+    try_agent_rename(herdr, pane_id, leader_name, env=env)
+
+    failures: list[str] = []
+    with ThreadPoolExecutor(max_workers=len(assignments) - 1) as pool:
+        futures = {
+            pool.submit(
+                start_report_agent,
+                herdr,
+                name=name,
+                kind=resolved_kind,
+                pane_id=pid,
+                agent_args=spawn_args,
+                env=env,
+            ): name
+            for pid, name in assignments[1:]
+        }
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                fut.result()
+                _log(f"turn-spawn: started {name}")
+            except RuntimeError as err:
+                failures.append(name)
+                _log(f"turn-spawn: {err}", error=True)
+    if failures:
+        # Roll back: close the panes this command created (and the agents
+        # started in them) so the tab returns to the single leader pane.
+        for pid, name in assignments[1:]:
+            try:
+                herdr_run(herdr, ["pane", "close", pid], env=env, allow_empty=True)
+                _log(f"turn-spawn: closed {name} ({pid})")
+            except RuntimeError as err:
+                _log(f"turn-spawn: could not close {name} ({pid}): {err}", error=True)
+        return _fail(
+            "turn-spawn: these reports did not become ready, so the hub was "
+            f"not started and the new panes were closed: "
+            f"{', '.join(sorted(failures))}. If the AI showed a first-run "
+            "dialog, start it once by hand to answer it, then retry",
+            1,
+        )
+
+    try:
+        leader, resolved_reports = resolve_hub_targets_from_current_tab(
+            herdr, env=env
+        )
+    except RuntimeError as err:
+        return _fail(f"turn-spawn: {err}", 1)
+    argv = build_turn_run_argv(
+        leader=leader,
+        reports=resolved_reports,
+        turns=turns,
+        goal=goal,
+        workdir=workdir,
+        notes_dir=resolved_notes,
+        daemon=True,
+    )
+    _log("turn-spawn: starting hub: herdr-turns " + " ".join(argv))
+    notify_herdr(
+        herdr,
+        "チームを起動しました",
+        f"{resolved_kind} × {len(resolved_reports)} 名。ターン制を開始します",
+        env=env,
+    )
+    code = main(argv)
+    if code != 0:
+        return _fail(f"turn-spawn: hub did not start (exit {code})", code)
+    return code
+
+
 # --- /auto-yes: toggle watcher that confirms Yes/proceed prompts ------------
 
 AUTO_YES_HINT_RE = re.compile(
@@ -6750,6 +7620,28 @@ def main(argv: list[str] | None = None) -> int:
                 cur["enabled"] = False
                 cur["pid"] = None
                 save_auto_yes_state(cur)
+
+    if raw_argv and raw_argv[0] in {"turn-stop", "/turn-stop"}:
+        stop_notes: Path | None = None
+        rest = raw_argv[1:]
+        for i, item in enumerate(rest):
+            if item == "--notes-dir" and i + 1 < len(rest):
+                stop_notes = Path(rest[i + 1])
+            elif item.startswith("--notes-dir="):
+                stop_notes = Path(item.split("=", 1)[1])
+        return run_turn_stop(herdr=herdr, notes_dir=stop_notes)
+
+    turn_spawn = extract_turn_spawn_argv(raw_argv)
+    if turn_spawn is not None:
+        return run_turn_spawn(
+            herdr=herdr,
+            spec_raw=turn_spawn["spec"],
+            reports_raw=turn_spawn["reports"],
+            kind=turn_spawn["kind"],
+            agent_args=turn_spawn["agent_args"],
+            notes_dir=turn_spawn["notes_dir"],
+            dry_run=turn_spawn["dry_run"],
+        )
 
     turn_run = extract_turn_run_argv(raw_argv)
     if turn_run is not None:

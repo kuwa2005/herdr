@@ -71,6 +71,7 @@ impl ClientContextMenuOverlay {
                 right_click_passthrough,
                 single_pane_tab,
                 is_hub_leader,
+                has_agent,
                 ..
             } => {
                 let mut items = vec![item(Msg::CtxRenamePane, Action::RenamePane)];
@@ -95,11 +96,16 @@ impl ClientContextMenuOverlay {
                 ]);
                 // Leader-hub only (no self-evolve / slash-command menu entries).
                 if *single_pane_tab {
+                    // Agent already running here: auto-build the team from it.
+                    if *has_agent {
+                        items.push(item(Msg::CtxTurnSpawn, Action::TurnSpawn));
+                    }
                     items.push(item(Msg::CtxTurnInit, Action::TurnInit));
                 }
                 // Boss pane after init (multi-pane tab). Never on a lone pane.
                 if *is_hub_leader && !*single_pane_tab {
                     items.push(item(Msg::CtxHubTurnRun, Action::HubTurnRun));
+                    items.push(item(Msg::CtxHubTurnStop, Action::HubTurnStop));
                 }
                 items.push(item(Msg::CtxClosePane, Action::ClosePane));
                 items
@@ -185,11 +191,14 @@ impl ClientShellState {
             .filter(|candidate| candidate.tab_id == tab_id)
             .count()
             == 1;
-        let agent_name = snapshot
+        let pane_agent = snapshot
             .agents
             .iter()
-            .find(|agent| agent.pane_id == pane_id)
-            .and_then(|agent| agent.name.as_deref());
+            .find(|agent| agent.pane_id == pane_id);
+        let agent_name = pane_agent.and_then(|agent| agent.name.as_deref());
+        let has_agent = pane_agent
+            .and_then(|agent| agent.agent.as_deref())
+            .is_some_and(|kind| !kind.trim().is_empty());
         let is_hub_leader = pane
             .label
             .as_deref()
@@ -204,6 +213,7 @@ impl ClientShellState {
                 right_click_passthrough: pane.right_click_passthrough,
                 single_pane_tab,
                 is_hub_leader,
+                has_agent,
             },
             x,
             y,
@@ -498,6 +508,13 @@ impl ClientShellState {
             ),
             ClientContextMenuAction::TurnInit => {
                 self.run_turn_init(pane_id, outcome);
+            }
+            ClientContextMenuAction::TurnSpawn => {
+                self.open_start_turns_overlay(pane_id, ClientStartTurnsMode::Spawn);
+                outcome.repaint = true;
+            }
+            ClientContextMenuAction::HubTurnStop => {
+                self.run_turn_stop(pane_id, outcome);
             }
             ClientContextMenuAction::HubTurnRun => {
                 self.open_start_turns_overlay(pane_id, ClientStartTurnsMode::LeaderHub);

@@ -437,6 +437,101 @@ fn pane_context_menu_single_pane_offers_turn_init_only() {
     }
 }
 
+fn pane_agent(kind: &str) -> ClientShellAgent {
+    ClientShellAgent {
+        pane_id: "pane_1".into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        name: None,
+        display_agent: None,
+        agent: Some(kind.into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: crate::api::schema::AgentStatus::Idle,
+        state_change_seq: 1,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: true,
+    }
+}
+
+fn right_click_pane_actions(state: &mut ClientShellState) -> Vec<ClientContextMenuAction> {
+    state.overlay = None;
+    state.compose(106, 20).expect("frame");
+    let pane = state.hits.panes[0].rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x + 1,
+        row: pane.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu
+            .items(crate::config::UiLanguage::Ja)
+            .iter()
+            .map(|item| item.action)
+            .collect(),
+        _ => panic!("pane context menu"),
+    }
+}
+
+#[test]
+fn pane_context_menu_single_pane_with_agent_offers_turn_spawn() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let actions = right_click_pane_actions(&mut state);
+    assert!(!actions.contains(&ClientContextMenuAction::TurnSpawn));
+
+    let mut snap = snapshot();
+    snap.agents.push(pane_agent("claude"));
+    state.set_snapshot(Box::new(snap));
+    let actions = right_click_pane_actions(&mut state);
+    assert!(actions.contains(&ClientContextMenuAction::TurnSpawn));
+    assert!(actions.contains(&ClientContextMenuAction::TurnInit));
+    assert!(!actions.contains(&ClientContextMenuAction::HubTurnRun));
+}
+
+#[test]
+fn turn_spawn_overlay_has_reports_field_and_validates_it() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.open_start_turns_overlay("pane_1".into(), ClientStartTurnsMode::Spawn);
+    state.compose(106, 20).expect("spawn overlay");
+    assert!(state.hits.start_turns_reports.width > 0);
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::StartTurns(overlay)) => {
+            assert_eq!(overlay.reports.as_str(), "3");
+        }
+        other => panic!("expected spawn overlay, got {other:?}"),
+    }
+    state.insert_start_turns_overlay_text("build the team");
+    state.focus_start_turns_field(ClientStartTurnsField::Reports);
+    if let Some(ClientShellOverlay::StartTurns(overlay)) = state.overlay.as_mut() {
+        assert_eq!(overlay.focused, ClientStartTurnsField::Reports);
+        overlay.reports = TextEditor::new("9", true);
+    }
+    state.submit_start_turns(&mut ClientShellInput::default());
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::StartTurns(overlay)) => {
+            assert_eq!(overlay.error.as_deref(), Some("reports must be 1-7"));
+            assert!(!overlay.starting);
+        }
+        other => panic!("expected reports validation error, got {other:?}"),
+    }
+
+    // Hub mode never focuses or shows the reports field.
+    state.open_start_turns_overlay("pane_1".into(), ClientStartTurnsMode::LeaderHub);
+    state.focus_start_turns_field(ClientStartTurnsField::Reports);
+    state.compose(106, 20).expect("hub overlay");
+    assert_eq!(state.hits.start_turns_reports.width, 0);
+    if let Some(ClientShellOverlay::StartTurns(overlay)) = state.overlay.as_ref() {
+        assert_eq!(overlay.focused, ClientStartTurnsField::Goal);
+    }
+}
+
 #[test]
 fn hub_turn_run_overlay_validates_goal_and_turns() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
@@ -663,6 +758,9 @@ fn pane_context_menu_offers_hub_turn_run_for_boss_label() {
     assert!(items
         .iter()
         .any(|item| item.action == ClientContextMenuAction::HubTurnRun));
+    assert!(items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::HubTurnStop));
     assert!(!items
         .iter()
         .any(|item| item.action == ClientContextMenuAction::TurnInit));

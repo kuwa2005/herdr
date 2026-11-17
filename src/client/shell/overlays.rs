@@ -23,6 +23,7 @@ pub(crate) struct OverlayRender {
     pub(crate) worktree_rows: Vec<(Rect, usize)>,
     pub(crate) start_turns_goal: Rect,
     pub(crate) start_turns_turns: Rect,
+    pub(crate) start_turns_reports: Rect,
     pub(crate) help_popup: Rect,
     pub(crate) help_scrollbar: Rect,
     pub(crate) help_scroll_metrics: Option<crate::pane::ScrollMetrics>,

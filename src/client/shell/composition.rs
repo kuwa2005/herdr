@@ -690,6 +690,7 @@ impl ClientShellState {
                 self.hits.worktree_rows = rendered.worktree_rows;
                 self.hits.start_turns_goal = rendered.start_turns_goal;
                 self.hits.start_turns_turns = rendered.start_turns_turns;
+                self.hits.start_turns_reports = rendered.start_turns_reports;
                 self.hits.help_popup = rendered.help_popup;
                 self.hits.help_scrollbar = rendered.help_scrollbar;
                 self.hits.help_scroll_metrics = rendered.help_scroll_metrics;
