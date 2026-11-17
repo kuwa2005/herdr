@@ -2937,6 +2937,121 @@ class LeaderHubRoutingTests(unittest.TestCase):
         )
         self.assertEqual(d.status, "DONE")
         self.assertEqual(d.next_agent, "a")
+        self.assertIsNone(d.unknown_next)
+
+    def test_parse_leader_directive_unknown_next_no_default_fallback(self) -> None:
+        d = turns.parse_leader_directive(
+            "NEXT: ghost\nROLE: x\nINSTRUCTION: nope\nSTATUS: CONTINUE\n",
+            known_agents=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertIsNone(d.next_agent)
+        self.assertEqual(d.unknown_next, "ghost")
+        self.assertNotEqual(d.next_agent, "alpha")
+
+        # Omitted NEXT still uses default
+        omitted = turns.parse_leader_directive(
+            "INSTRUCTION: go\nSTATUS: CONTINUE\n",
+            known_agents=["alpha", "beta"],
+            default_next="beta",
+        )
+        self.assertEqual(omitted.next_agent, "beta")
+        self.assertIsNone(omitted.unknown_next)
+
+        # Leader name is outside report pool when pool is workers-only
+        leader_as_next = turns.parse_leader_directive(
+            "NEXT: boss\nSTATUS: CONTINUE\n",
+            known_agents=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertEqual(leader_as_next.unknown_next, "boss")
+        self.assertIsNone(leader_as_next.next_agent)
+
+    def test_leader_briefing_says_unknown_next_no_fallback(self) -> None:
+        route = turns.LeaderHubRoute(
+            leader="boss",
+            workers=["a", "b"],
+            order=["a", "b"],
+        )
+        prompt = turns.leader_briefing_prompt(
+            turn=1,
+            turns=2,
+            step=1,
+            steps=2,
+            route=route,
+            goal="g",
+            workdir=Path("/repo"),
+            notes_dir=Path("/notes"),
+            default_next="a",
+            last_agent=None,
+            last_output="(empty)",
+        )
+        self.assertIn("no default fallback", prompt.lower())
+        self.assertIn("one retry", prompt.lower())
+
+    def test_leader_unknown_next_reprompt_lists_valid_names(self) -> None:
+        prompt = turns.leader_unknown_next_reprompt(
+            turn=1,
+            turns=3,
+            step=2,
+            steps=3,
+            leader="boss",
+            invalid_next="ghost",
+            workers=["agent-a", "agent-b", "agent-c"],
+            default_next="agent-a",
+        )
+        self.assertIn("ghost", prompt)
+        self.assertIn("agent-a, agent-b, agent-c", prompt)
+        self.assertIn("only retry", prompt.lower())
+        self.assertIn("no silent default fallback", prompt.lower())
+        self.assertIn("NEXT:", prompt)
+
+    def test_parse_leader_directive_after_unknown_retry(self) -> None:
+        initial = turns.parse_leader_directive(
+            "NEXT: ghost\nINSTRUCTION: bad\nSTATUS: CONTINUE\n",
+            known_agents=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertEqual(initial.unknown_next, "ghost")
+        self.assertIsNone(initial.next_agent)
+
+        # Valid retry → accept pool member; still not inventing default
+        fixed = turns.parse_leader_directive_after_unknown_retry(
+            initial,
+            "NEXT: beta\nROLE: 実装役\nINSTRUCTION: ok\nSTATUS: CONTINUE\n",
+            workers=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertIsNone(fixed.unknown_next)
+        self.assertEqual(fixed.next_agent, "beta")
+        self.assertEqual(fixed.role, "実装役")
+
+        # Still invalid → unknown_next stays; must NOT become default_next
+        still_bad = turns.parse_leader_directive_after_unknown_retry(
+            initial,
+            "NEXT: spectre\nINSTRUCTION: still bad\nSTATUS: CONTINUE\n",
+            workers=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertEqual(still_bad.unknown_next, "spectre")
+        self.assertIsNone(still_bad.next_agent)
+        self.assertNotEqual(still_bad.next_agent, "alpha")
+
+        # No unknown on initial → unchanged (no forced reparse)
+        ok = turns.LeaderDirective(
+            next_agent="alpha",
+            instruction="x",
+            status="CONTINUE",
+            role=None,
+            unknown_next=None,
+        )
+        same = turns.parse_leader_directive_after_unknown_retry(
+            ok,
+            "NEXT: beta\nSTATUS: CONTINUE\n",
+            workers=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertIs(same, ok)
 
     def test_wants_leader_hub_and_nested_disabled(self) -> None:
         hub = self._ns(leader="boss", participants=["a"])
@@ -2966,7 +3081,159 @@ class LeaderHubRoutingTests(unittest.TestCase):
         )
         self.assertIn("NOT fixed", prompt)
         self.assertIn("Report pool", prompt)
+        self.assertIn("ROLE:", prompt)
         self.assertNotIn("project-leader", prompt.lower())
+
+    def test_parse_leader_directive_optional_role(self) -> None:
+        with_role = (
+            "NEXT: alpha\n"
+            "ROLE: 調査役\n"
+            "INSTRUCTION: Inventory hub routing and report.\n"
+            "STATUS: CONTINUE\n"
+        )
+        d = turns.parse_leader_directive(
+            with_role,
+            known_agents=["boss", "alpha", "beta"],
+            default_next="beta",
+        )
+        self.assertEqual(d.next_agent, "alpha")
+        self.assertEqual(d.role, "調査役")
+        self.assertIn("Inventory hub routing", d.instruction or "")
+
+        without = turns.parse_leader_directive(
+            "NEXT: beta\nINSTRUCTION: just do the task\nSTATUS: CONTINUE\n",
+            known_agents=["boss", "alpha", "beta"],
+        )
+        self.assertIsNone(without.role)
+        self.assertEqual(without.next_agent, "beta")
+
+    def test_prepend_role_to_instruction(self) -> None:
+        self.assertEqual(
+            turns.prepend_role_to_instruction("check the diff", "verifier"),
+            "ROLE: verifier\ncheck the diff",
+        )
+        # Already leads with ROLE: — do not double-prepend
+        self.assertEqual(
+            turns.prepend_role_to_instruction(
+                "ROLE: verifier\ncheck the diff", "verifier"
+            ),
+            "ROLE: verifier\ncheck the diff",
+        )
+        # Already leads with the role label
+        self.assertEqual(
+            turns.prepend_role_to_instruction("verifier: check", "verifier"),
+            "verifier: check",
+        )
+        # No role → unchanged
+        self.assertEqual(
+            turns.prepend_role_to_instruction("check the diff", None),
+            "check the diff",
+        )
+        self.assertEqual(
+            turns.prepend_role_to_instruction("", "調査役"),
+            "ROLE: 調査役",
+        )
+
+    def test_worker_assignment_prompt_reflects_role(self) -> None:
+        with_role = turns.worker_assignment_prompt(
+            turn=1,
+            turns=3,
+            step=1,
+            steps=2,
+            worker="agent-a",
+            leader="boss",
+            goal="ship",
+            workdir=Path("/repo"),
+            instruction="ROLE: 調査役\nDo the inventory.",
+            role="調査役",
+        )
+        self.assertIn("Assigned ROLE: `調査役`", with_role)
+        self.assertIn("ROLE: 調査役", with_role)
+        self.assertIn("Do the inventory.", with_role)
+
+        without = turns.worker_assignment_prompt(
+            turn=1,
+            turns=3,
+            step=1,
+            steps=2,
+            worker="agent-a",
+            leader="boss",
+            goal="ship",
+            workdir=Path("/repo"),
+            instruction="Do the inventory.",
+            role=None,
+        )
+        self.assertIn("whatever INSTRUCTION says", without)
+        self.assertNotIn("Assigned ROLE:", without)
+
+
+
+    def test_worker_assignment_prompt_includes_prior_handoff(self) -> None:
+        step1 = turns.worker_assignment_prompt(
+            turn=2,
+            turns=3,
+            step=1,
+            steps=3,
+            worker="agent-a",
+            leader="boss",
+            goal="handoff",
+            workdir=Path("/repo"),
+            instruction="ROLE: 調査役\nStart inventory.",
+            role="調査役",
+        )
+        self.assertIn("--- Prior worker handoff ---", step1)
+        self.assertIn("_(なし", step1)
+        self.assertNotIn("Previous report:", step1)
+        # ROLE path still intact on step 1
+        self.assertIn("Assigned ROLE: `調査役`", step1)
+
+        step2 = turns.worker_assignment_prompt(
+            turn=2,
+            turns=3,
+            step=2,
+            steps=3,
+            worker="agent-b",
+            leader="boss",
+            goal="handoff",
+            workdir=Path("/repo"),
+            instruction="ROLE: 実装役\nImplement bind.",
+            role="実装役",
+            prior_agent="agent-a",
+            prior_role="調査役",
+            prior_summary="Found resolve_hub_targets needs label fallback.",
+        )
+        self.assertIn("--- Prior worker handoff ---", step2)
+        self.assertIn("Previous report: `agent-a`", step2)
+        self.assertIn("Previous ROLE: `調査役`", step2)
+        self.assertIn(
+            "Found resolve_hub_targets needs label fallback.",
+            step2,
+        )
+        self.assertIn("Assigned ROLE: `実装役`", step2)
+        self.assertIn("Implement bind.", step2)
+
+    def test_summarize_prior_worker_handoff_prefers_notes_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "worker.md"
+            notes.write_text(
+                "# header\n" + ("old line\n" * 20) + "LATEST RESULT: bind done\n",
+                encoding="utf-8",
+            )
+            summary = turns.summarize_prior_worker_handoff(
+                screen_text="stale screen",
+                notes_path=notes,
+                max_chars=80,
+            )
+            self.assertIn("LATEST RESULT: bind done", summary)
+            self.assertNotIn("stale screen", summary)
+        # Fallback to screen when notes missing
+        screen_only = turns.summarize_prior_worker_handoff(
+            screen_text="screen evidence here",
+            notes_path=Path("/no/such/file.md"),
+        )
+        self.assertIn("screen evidence here", screen_only)
+        empty = turns.summarize_prior_worker_handoff()
+        self.assertEqual(empty, "_(なし)_")
 
 
 
@@ -3105,6 +3372,150 @@ class TurnRunTests(unittest.TestCase):
         self.assertIn("--daemon", argv)
         self.assertIn("--goal", argv)
         self.assertIn("g", argv)
+
+    def test_hub_target_name_prefers_agent_then_label(self) -> None:
+        self.assertEqual(
+            turns.hub_target_name(agent_name="boss", pane_label="label"),
+            "boss",
+        )
+        self.assertEqual(
+            turns.hub_target_name(agent_name=None, pane_label="agent-a"),
+            "agent-a",
+        )
+        self.assertEqual(
+            turns.hub_target_name(agent_name="  ", pane_label=" agent-b "),
+            "agent-b",
+        )
+        self.assertIsNone(
+            turns.hub_target_name(agent_name=None, pane_label=None)
+        )
+        self.assertIsNone(
+            turns.hub_target_name(agent_name="", pane_label="  ")
+        )
+
+    def _fake_hub_json_factory(
+        self,
+        *,
+        layout_panes: list[dict],
+        agents: list[dict],
+        labeled_panes: list[dict],
+        renames: list[tuple[str, str]] | None = None,
+    ):
+        rename_log = renames if renames is not None else []
+
+        def fake_herdr_json(herdr: str, argv: list[str], env=None) -> dict:
+            del herdr, env
+            if argv[:2] == ["pane", "layout"]:
+                return {"result": {"layout": {"panes": layout_panes}}}
+            if argv[:2] == ["agent", "list"]:
+                return {"result": {"agents": agents}}
+            if argv[:2] == ["pane", "list"]:
+                return {"result": {"panes": labeled_panes}}
+            if argv[:2] == ["agent", "rename"]:
+                rename_log.append((argv[2], argv[3]))
+                return {"ok": True}
+            raise AssertionError(f"unexpected herdr_json {argv}")
+
+        return fake_herdr_json
+
+    def test_resolve_hub_targets_label_only(self) -> None:
+        layout = [
+            {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}},
+            {"pane_id": "w1:p2", "rect": {"x": 10, "y": 0}},
+            {"pane_id": "w1:p3", "rect": {"x": 0, "y": 10}},
+        ]
+        labeled = [
+            {"pane_id": "w1:p1", "label": "boss"},
+            {"pane_id": "w1:p2", "label": "agent-a"},
+            {"pane_id": "w1:p3", "label": "agent-b"},
+        ]
+        fake = self._fake_hub_json_factory(
+            layout_panes=layout, agents=[], labeled_panes=labeled
+        )
+        with (
+            mock.patch.object(turns, "herdr_json", side_effect=fake),
+            mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}, clear=False),
+        ):
+            leader, reports = turns.resolve_hub_targets_from_current_tab("herdr")
+        self.assertEqual(leader, "boss")
+        self.assertEqual(reports, ["agent-a", "agent-b"])
+
+    def test_resolve_hub_targets_agent_names(self) -> None:
+        layout = [
+            {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}},
+            {"pane_id": "w1:p2", "rect": {"x": 10, "y": 0}},
+        ]
+        agents = [
+            {"pane_id": "w1:p1", "name": "lead"},
+            {"pane_id": "w1:p2", "name": "r1"},
+        ]
+        fake = self._fake_hub_json_factory(
+            layout_panes=layout, agents=agents, labeled_panes=[]
+        )
+        with (
+            mock.patch.object(turns, "herdr_json", side_effect=fake),
+            mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}, clear=False),
+        ):
+            leader, reports = turns.resolve_hub_targets_from_current_tab("herdr")
+        self.assertEqual(leader, "lead")
+        self.assertEqual(reports, ["r1"])
+
+    def test_resolve_hub_targets_mixed_agent_and_label(self) -> None:
+        layout = [
+            {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}},
+            {"pane_id": "w1:p2", "rect": {"x": 10, "y": 0}},
+            {"pane_id": "w1:p3", "rect": {"x": 0, "y": 10}},
+        ]
+        # Leader has agent name; one report is label-only; one has both
+        # (agent name wins over a different label).
+        agents = [
+            {"pane_id": "w1:p1", "name": "boss"},
+            {"pane_id": "w1:p3", "name": "live-c"},
+        ]
+        labeled = [
+            {"pane_id": "w1:p1", "label": "ignored-leader-label"},
+            {"pane_id": "w1:p2", "label": "agent-a"},
+            {"pane_id": "w1:p3", "label": "agent-c"},
+        ]
+        fake = self._fake_hub_json_factory(
+            layout_panes=layout, agents=agents, labeled_panes=labeled
+        )
+        with (
+            mock.patch.object(turns, "herdr_json", side_effect=fake),
+            mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}, clear=False),
+        ):
+            leader, reports = turns.resolve_hub_targets_from_current_tab("herdr")
+        self.assertEqual(leader, "boss")
+        self.assertEqual(reports, ["agent-a", "live-c"])
+
+    def test_bind_pane_labels_to_agents_renames_mismatched(self) -> None:
+        layout = [
+            {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}},
+            {"pane_id": "w1:p2", "rect": {"x": 10, "y": 0}},
+            {"pane_id": "w1:p3", "rect": {"x": 0, "y": 10}},
+        ]
+        agents = [
+            {"pane_id": "w1:p1", "name": "wrong-boss"},
+            {"pane_id": "w1:p2", "name": "agent-a"},  # already matched
+            # p3 live but empty name → should rename
+            {"pane_id": "w1:p3", "name": ""},
+        ]
+        labeled = [
+            {"pane_id": "w1:p1", "label": "boss"},
+            {"pane_id": "w1:p2", "label": "agent-a"},
+            {"pane_id": "w1:p3", "label": "agent-b"},
+        ]
+        renames: list[tuple[str, str]] = []
+        fake = self._fake_hub_json_factory(
+            layout_panes=layout,
+            agents=agents,
+            labeled_panes=labeled,
+            renames=renames,
+        )
+        with mock.patch.object(turns, "herdr_json", side_effect=fake):
+            bound = turns.bind_pane_labels_to_agents("herdr")
+        self.assertEqual(bound, [("w1:p1", "boss"), ("w1:p3", "agent-b")])
+        self.assertEqual(renames, [("w1:p1", "boss"), ("w1:p3", "agent-b")])
 
 
 

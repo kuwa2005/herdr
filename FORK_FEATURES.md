@@ -20,11 +20,13 @@ Herdr 管理ペイン内では `HERDR_ENV=1` / `HERDR_PANE_ID` が付きます�
 ### 何ができるか
 
 - リーダー 1 名 + 部下（reports）最大 3 名（合計最大 4）
-- **部下の役割は固定しない**（名前は身分だけ。毎回リーダーが役割と作業を割り当てる）
-- 流れ: 部下の TUI を読む → リーダーへ渡す → `NEXT` / `INSTRUCTION` / `STATUS` → 指名した部下へ投入
+- **部下の役割は固定しない**（名前は身分だけ。毎回リーダーが `ROLE` / `INSTRUCTION` で役割と作業を割り当てる）
+- 流れ: 部下の TUI を読む → リーダーへ渡す → `NEXT` / `ROLE` / `INSTRUCTION` / `STATUS` → 指名した部下へ投入
+- ステップ 2 以降は直前部下の要約（prior handoff）を次の部下へ渡す
 
 ```text
-部下ペイン (最大3) -- read --> リーダー -- NEXT/INSTRUCTION --> 次の部下
+部下ペイン (最大3) -- read --> リーダー -- NEXT/ROLE/INSTRUCTION --> 次の部下
+                                      \-- prior handoff (前ステップ要約) --/
 ```
 
 自己進化の `--from-here`（director/coder/reviewer ネスト）とは**別経路**です。
@@ -50,7 +52,7 @@ herdr-turns /turn-run 3,"ここに目的"
 | --- | --- |
 | 前提 | **現在タブがシングルペインのみ** |
 | 引数なし | `boss,agent-a,agent-b,agent-c` |
-| 動作 | 名前数に合わせて分割（4 なら 2×2）→ 視覚順（上→下・左→右）で `agent rename` |
+| 動作 | 名前数に合わせて分割（4 なら 2×2）→ 視覚順（上→下・左→右）で `pane rename`（agent がいれば `agent rename` も） |
 | dry-run | 分割・改名はしない |
 
 ```bash
@@ -65,8 +67,9 @@ herdr-turns turn-init --dry-run                 # 確認のみ
 
 | 自動割当 | 内容 |
 | --- | --- |
-| `--leader` | 現在ペインの**名前付き**エージェント |
-| `--participant` | 同じタブの他の名前付きエージェント（最大 3） |
+| bind | 起動前に pane ラベル → 生きている agent へ `agent rename` を再適用 |
+| `--leader` | 現在ペインの名前（agent 名、無ければ pane ラベル） |
+| `--participant` | 同じタブの他ペイン（最大 3。agent 名優先、なければ pane ラベル） |
 | `--turns` / `--goal` | 引数の `TURNS,"goal"` |
 | その他既定 | `--daemon`、`--notes-dir ./hub-notes`、`--workdir "$PWD"` |
 
@@ -100,11 +103,27 @@ herdr-turns \
 
 ```text
 NEXT: agent-b
-INSTRUCTION: 今回は検証役として差分を見て問題を列挙して
+ROLE: 検証役
+INSTRUCTION: 差分を見て問題を列挙して
 STATUS: CONTINUE
 ```
 
-`STATUS` は `CONTINUE` / `DONE` / `STOP` / `ESCALATE`。成果物は `notes-dir` の `TURN*_HUB.md` / `TURN*_LEADER_STEP*.md` / `TURN*_WORKER_*` など。
+| フィールド | 必須 | 意味 |
+| --- | --- | --- |
+| `NEXT` | 推奨 | report pool 内の名前。**省略時のみ** `--order` の default を使う。pool 外の名前は **警告のうえ fail**（default へフォールバックしない） |
+| `ROLE` | 任意 | 短い役割ラベル。worker prompt / `TURN*_HUB` / worker notes に記録。INSTRUCTION 先頭に役割が無ければ `ROLE: …` を前置して部下へ渡す |
+| `INSTRUCTION` | 推奨 | そのステップの作業内容 |
+| `STATUS` | 推奨 | `CONTINUE` / `DONE` / `STOP` / `ESCALATE` |
+
+### pane→agent bind
+
+`/turn-init` は分割直後に **pane ラベル**を付ける（agent 未起動なら agent rename はスキップ）。各ペインで AI を起動したあと `/turn-run` が **bind** し、pane ラベルを生きている agent 名へ揃える。名前解決は agent 名優先、無ければ pane ラベル。
+
+### 直前手渡し（prior handoff）
+
+同じターンのステップ 2 以降、次の部下の assignment に直前部下の名前・ROLE・要約（notes 優先、なければ画面）を付ける。ステップ 1 は `_(なし)_`。
+
+成果物は `notes-dir` の `TURN*_HUB.md` / `TURN*_LEADER_STEP*.md` / `TURN*_WORKER_*` など。
 
 ---
 
@@ -170,9 +189,10 @@ herdr-turns --from-here --daemon --turns 5 \
 
 ## 5. 注意事項
 
-- ペイン同士が直接チャットする配線はない。ランナーが `agent read` / `agent prompt` で仲介する。
+- ペイン同士が直接チャットする配線はない。ランナーが `agent read` / `agent prompt` で仲介する（prior handoff もランナー経由）。
 - `/turn-init` は**分割済みタブでは動かない**（シングルペイン専用）。
-- `/turn-run` の前に、対象ペインでエージェントが起動済みで、名前が付いていること（`/turn-init` 後に各ペインで AI を起動する運用が一般的）。
+- `/turn-run` 前に各ペインで AI を起動する。bind が pane ラベルと agent 名を揃える（手動 `herdr agent rename` も可）。
+- リーダーの `NEXT` は report pool 内のみ。未知名は fail（default NEXT へ落とさない）。
 - 前景でリーダー自身を待ち続けるとデッドロックしやすい。`/turn-run` と `--from-here` は daemon 前提。
 - upstream への機能 Issue / 実装 PR は出さない（フォーク所有者運用。詳細は `FORK.md` / `AGENTS.md`）。
 

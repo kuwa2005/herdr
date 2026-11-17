@@ -41,8 +41,9 @@ Manual multi-party (2–4 already-running named agents, no nest/split):
   splits to a grid then renames panes in visual order.
 * **Run hub**: from the leader pane, ``herdr-turns /turn-run 3,"goal"``
   (or ``turn-run 3,"goal"``) starts the leader-hub loop (daemon) using
-  the current pane as ``--leader`` and other named agents in the tab as
-  ``--participant``.
+  the current pane as ``--leader`` and other tab targets as
+  ``--participant`` (agent name, else pane label; live agents are
+  rebound to labels when needed).
 * **Auto-yes**: ``herdr-turns /auto-yes`` toggles a background watcher
   (default off) that answers Yes/proceed confirmations on blocked agent
   panes. Run ``/auto-yes`` again to disable.
@@ -186,6 +187,10 @@ class LeaderDirective:
     next_agent: str | None
     instruction: str | None
     status: str  # CONTINUE | DONE | STOP | ESCALATE
+    role: str | None = None  # optional short ROLE: label from leader
+    # Set when NEXT was present but not in the allowed report pool.
+    # Callers must NOT fall back to default_next when this is set.
+    unknown_next: str | None = None
 
 
 @dataclass
@@ -707,6 +712,9 @@ LEADER_STATUS_RE = re.compile(
     r"(?im)^\s*STATUS\s*:\s*(CONTINUE|DONE|STOP|ESCALATE)\s*$"
 )
 LEADER_INSTRUCTION_LINE_RE = re.compile(r"(?im)^\s*INSTRUCTION\s*:\s*(.*)$")
+LEADER_ROLE_RE = re.compile(r"(?im)^\s*ROLE\s*:\s*(.+?)\s*$")
+HUB_ROLE_MAX_CHARS = 80
+HUB_PRIOR_HANDOFF_MAX_CHARS = 1_200
 
 
 def wants_leader_hub(args: argparse.Namespace) -> bool:
@@ -766,23 +774,85 @@ def resolve_leader_hub_route(args: argparse.Namespace) -> LeaderHubRoute:
     )
 
 
+def normalize_hub_role(raw: str | None) -> str | None:
+    """Normalize an optional leader ROLE label (short; empty → None)."""
+    if raw is None:
+        return None
+    role = " ".join(str(raw).split()).strip()
+    if not role:
+        return None
+    if len(role) > HUB_ROLE_MAX_CHARS:
+        role = role[:HUB_ROLE_MAX_CHARS].rstrip()
+    return role
+
+
+def instruction_starts_with_role(instruction: str, role: str) -> bool:
+    """True when *instruction* already leads with ROLE: or the role label."""
+    head = (instruction or "").lstrip()
+    if not head:
+        return False
+    if re.match(r"(?i)^ROLE\s*:", head):
+        return True
+    role_cf = role.casefold()
+    first_line = head.splitlines()[0].strip()
+    if first_line.casefold() == role_cf:
+        return True
+    if first_line.casefold().startswith(role_cf + ":"):
+        return True
+    if first_line.casefold().startswith(role_cf + " "):
+        return True
+    return False
+
+
+def prepend_role_to_instruction(instruction: str, role: str | None) -> str:
+    """Prepend ``ROLE: <role>`` when instruction does not already lead with it."""
+    body = (instruction or "").strip()
+    role_s = normalize_hub_role(role)
+    if not role_s:
+        return body
+    if instruction_starts_with_role(body, role_s):
+        return body
+    if not body:
+        return f"ROLE: {role_s}"
+    return f"ROLE: {role_s}\n{body}"
+
+
 def parse_leader_directive(
     text: str,
     *,
     known_agents: list[str],
     default_next: str | None = None,
 ) -> LeaderDirective:
-    """Extract NEXT / INSTRUCTION / STATUS from a leader pane snapshot."""
+    """Extract NEXT / ROLE / INSTRUCTION / STATUS from a leader pane snapshot.
+
+    ``ROLE`` is optional (short label). Missing ROLE yields ``role=None``.
+
+    ``NEXT`` omitted → fall back to ``default_next`` when provided.
+    ``NEXT`` present but outside ``known_agents`` (report pool) →
+    ``unknown_next`` is set and ``next_agent`` stays ``None``. Callers must
+    **not** substitute ``default_next`` in that case (warn or fail instead).
+    """
     body = text or ""
     status_m = LEADER_STATUS_RE.search(body)
     status = status_m.group(1).upper() if status_m else "CONTINUE"
 
     next_m = LEADER_NEXT_RE.search(body)
-    next_agent = next_m.group(1).strip() if next_m else None
-    if next_agent:
+    next_raw = next_m.group(1).strip() if next_m else None
+    next_agent: str | None = None
+    unknown_next: str | None = None
+    if next_raw:
         by_key = {a.casefold(): a for a in known_agents}
-        canon = by_key.get(next_agent.casefold())
-        next_agent = canon  # None if unknown — caller may fall back
+        canon = by_key.get(next_raw.casefold())
+        if canon is not None:
+            next_agent = canon
+        else:
+            # Explicit unknown — do NOT fall back to default_next.
+            unknown_next = next_raw
+    elif default_next is not None:
+        next_agent = default_next
+
+    role_m = LEADER_ROLE_RE.search(body)
+    role = normalize_hub_role(role_m.group(1) if role_m else None)
 
     instruction: str | None = None
     instr_m = LEADER_INSTRUCTION_LINE_RE.search(body)
@@ -795,19 +865,68 @@ def parse_leader_directive(
             rest_lines.append(first)
         for line in body[start:].splitlines():
             if re.match(
-                r"(?i)^\s*(NEXT|STATUS|INSTRUCTION|VERDICT|TASK|DONE_WHEN)\s*:",
+                r"(?i)^\s*(NEXT|STATUS|INSTRUCTION|ROLE|VERDICT|TASK|DONE_WHEN)\s*:",
                 line,
             ):
                 break
             rest_lines.append(line.rstrip())
         instruction = "\n".join(rest_lines).strip() or None
 
-    if next_agent is None and default_next is not None:
-        next_agent = default_next
     return LeaderDirective(
         next_agent=next_agent,
         instruction=instruction,
         status=status,
+        role=role,
+        unknown_next=unknown_next,
+    )
+
+
+def leader_unknown_next_reprompt(
+    *,
+    turn: int,
+    turns: int,
+    step: int,
+    steps: int,
+    leader: str,
+    invalid_next: str,
+    workers: list[str],
+    default_next: str,
+) -> str:
+    """One-shot correction prompt when NEXT is outside the report pool."""
+    pool = ", ".join(workers)
+    return (
+        f"Turn {turn}/{turns} LEADER HUB (step {step}/{steps}) — NEXT retry.\n"
+        f"You are the leader agent `{leader}`.\n"
+        f"Your previous NEXT `{invalid_next}` is NOT in the report pool.\n"
+        f"Valid report names (pick exactly one): {pool}\n"
+        f"Do not use the leader name or any name outside that list.\n"
+        f"Default NEXT applies ONLY if you omit NEXT entirely: {default_next}\n"
+        f"(An explicit invalid NEXT still fails — no silent default fallback.)\n"
+        f"This is your only retry for this step. Reply again with EXACTLY:\n"
+        f"NEXT: <one name from: {pool}>\n"
+        f"ROLE: <optional short role label>\n"
+        f"INSTRUCTION: <task for that report>\n"
+        f"STATUS: CONTINUE|DONE|STOP|ESCALATE\n"
+    )
+
+
+def parse_leader_directive_after_unknown_retry(
+    initial: LeaderDirective,
+    retry_text: str,
+    *,
+    workers: list[str],
+    default_next: str,
+) -> LeaderDirective:
+    """Re-parse after an unknown-NEXT retry; unchanged when no retry needed.
+
+    Does not invent a default when the retry still names an unknown agent.
+    """
+    if not initial.unknown_next:
+        return initial
+    return parse_leader_directive(
+        retry_text,
+        known_agents=workers,
+        default_next=default_next,
     )
 
 
@@ -902,11 +1021,14 @@ def leader_briefing_prompt(
         f"{acc}"
         f"Report pool (names only): {workers_s}\n"
         f"Default visitation hint: {order_s}\n"
-        f"Default NEXT if you omit NEXT: {default_next}\n"
+        f"Default NEXT only if you omit NEXT: {default_next}\n"
+        f"(Unknown NEXT outside the report pool gets one retry, then "
+        f"fails — no default fallback.)\n"
         f"Last report: {last_label}\n"
         f"Reply on screen with EXACTLY these fields:\n"
         f"NEXT: <one name from the report pool>\n"
-        f"INSTRUCTION: <role + task for that report this step>\n"
+        f"ROLE: <optional short role label for that report>\n"
+        f"INSTRUCTION: <task for that report this step>\n"
         f"STATUS: CONTINUE|DONE|STOP|ESCALATE\n"
         f"Known agents: {known}\n"
         f"Notes path hint: {notes_dir}/TURN{turn}_LEADER_STEP{step}.md\n"
@@ -915,6 +1037,67 @@ def leader_briefing_prompt(
         f"--- end ---\n"
         f"Choose who acts next and what role they play from the evidence. "
         f"Do not commit unless asked.\n"
+    )
+
+
+def summarize_prior_worker_handoff(
+    *,
+    screen_text: str | None = None,
+    notes_path: Path | None = None,
+    max_chars: int = HUB_PRIOR_HANDOFF_MAX_CHARS,
+) -> str:
+    """Build a short prior-worker summary for the next assignment.
+
+    Prefers the worker notes file (tail when long); falls back to the live
+    screen snapshot. Empty input → ``_(なし)_``.
+    """
+    text = ""
+    if notes_path is not None and notes_path.is_file():
+        try:
+            text = notes_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+    if not text and isinstance(screen_text, str):
+        text = screen_text.strip()
+    if not text:
+        return "_(なし)_"
+    # Prefer the trailing portion of long notes (latest outcome).
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+        # Avoid starting mid-line when possible.
+        nl = text.find("\n")
+        if 0 <= nl < 80:
+            text = text[nl + 1 :]
+        text = text.lstrip()
+    return _truncate_chars(text, max_chars)
+
+
+def format_prior_worker_section(
+    *,
+    step: int,
+    prior_agent: str | None = None,
+    prior_role: str | None = None,
+    prior_summary: str | None = None,
+) -> str:
+    """Explicit handoff block for worker prompts.
+
+    Step 1 (or no prior agent) states that there is no prior handoff.
+    Later steps always include prior report name, ROLE, and key points.
+    """
+    if step <= 1 or not prior_agent:
+        return (
+            "--- Prior worker handoff ---\n"
+            "_(なし — first step in this turn)_\n"
+            "--- end prior handoff ---\n"
+        )
+    role_s = normalize_hub_role(prior_role) or "_(none)_"
+    summary = (prior_summary or "").strip() or "_(empty)_"
+    return (
+        "--- Prior worker handoff ---\n"
+        f"Previous report: `{prior_agent}`\n"
+        f"Previous ROLE: `{role_s}`\n"
+        f"Key points / snapshot:\n{summary}\n"
+        "--- end prior handoff ---\n"
     )
 
 
@@ -929,15 +1112,41 @@ def worker_assignment_prompt(
     goal: str,
     workdir: Path,
     instruction: str,
+    role: str | None = None,
+    prior_agent: str | None = None,
+    prior_role: str | None = None,
+    prior_summary: str | None = None,
 ) -> str:
-    """Forward the leader's instruction to a worker agent."""
+    """Forward the leader's instruction to a worker agent.
+
+    Includes an explicit prior-worker handoff section (none on step 1;
+    report name / ROLE / summary on later steps).
+    """
+    role_s = normalize_hub_role(role)
+    if role_s:
+        role_line = (
+            f"From leader `{leader}`. Assigned ROLE: `{role_s}` "
+            f"(not a fixed job title — this step only).\n"
+            f"ROLE: {role_s}\n"
+        )
+    else:
+        role_line = (
+            f"From leader `{leader}`. Your role is whatever INSTRUCTION says "
+            f"(not a fixed job title).\n"
+        )
+    handoff = format_prior_worker_section(
+        step=step,
+        prior_agent=prior_agent,
+        prior_role=prior_role,
+        prior_summary=prior_summary,
+    )
     return (
         f"Turn {turn}/{turns} REPORT assignment "
         f"(step {step}/{steps} → you are `{worker}`).\n"
-        f"From leader `{leader}`. Your role is whatever INSTRUCTION says "
-        f"(not a fixed job title).\n"
+        f"{role_line}"
         f"Workdir: {workdir}\n"
         f"Overall goal: {goal}\n"
+        f"{handoff}"
         f"INSTRUCTION:\n{instruction.strip()}\n"
         f"Do that work in this pane. When done, leave a clear on-screen summary "
         f"for the leader. Do not commit unless asked.\n"
@@ -956,7 +1165,6 @@ def run_leader_hub_turns(
 ) -> int:
     """Run leader-hub turns: read worker → brief leader → prompt NEXT worker."""
     ensure_notes_dir(notes_dir)
-    known = [route.leader, *route.workers]
     records_notes: list[str] = []
     stop_reason: str | None = None
     exit_code = 0
@@ -980,6 +1188,8 @@ def run_leader_hub_turns(
         write_skeleton(hub_path, f"Turn {turn} leader hub")
         steps_log: list[str] = [f"# Turn {turn} leader hub\n"]
         last_agent: str | None = None
+        last_role: str | None = None
+        last_notes_path: Path | None = None
         last_output = (
             "(start of turn — no worker output yet; "
             "choose the first worker and give an initial INSTRUCTION)"
@@ -1013,6 +1223,7 @@ def run_leader_hub_turns(
                 step_leader_path.write_text(
                     f"# Turn {turn} leader step {step_index}\n\n"
                     f"NEXT: {default_next}\n"
+                    f"ROLE: dry-run\n"
                     f"INSTRUCTION: dry-run placeholder for {default_next}\n"
                     f"STATUS: CONTINUE\n",
                     encoding="utf-8",
@@ -1021,6 +1232,7 @@ def run_leader_hub_turns(
                     next_agent=default_next,
                     instruction=f"dry-run placeholder for {default_next}",
                     status="CONTINUE",
+                    role="dry-run",
                 )
             else:
                 prompt_and_wait(
@@ -1037,19 +1249,94 @@ def run_leader_hub_turns(
                     f"# Turn {turn} leader step {step_index}\n\n{leader_text}\n",
                     encoding="utf-8",
                 )
+                # Validate NEXT against the report pool only (not the leader).
                 directive = parse_leader_directive(
                     leader_text,
-                    known_agents=known,
+                    known_agents=route.workers,
                     default_next=default_next,
                 )
 
+            next_display = (
+                directive.unknown_next
+                if directive.unknown_next
+                else directive.next_agent
+            )
             steps_log.append(
                 f"## Step {step_index}\n"
                 f"- default_next: `{default_next}`\n"
-                f"- NEXT: `{directive.next_agent}`\n"
+                f"- NEXT: `{next_display}`\n"
+                f"- ROLE: `{directive.role or '_(none)_'}`\n"
                 f"- STATUS: `{directive.status}`\n"
                 f"- INSTRUCTION: {directive.instruction or '_(missing)_'}\n"
             )
+            # One retry when CONTINUE + unknown NEXT (never silently
+            # fall back to default_next).
+            if directive.unknown_next and directive.status == "CONTINUE":
+                invalid = directive.unknown_next
+                pool = ", ".join(route.workers)
+                steps_log.append(
+                    f"- NEXT_ERROR: `{invalid}` outside report pool; "
+                    f"re-prompting once (no default_next fallback)\n"
+                )
+                print(
+                    f"warning: leader NEXT {invalid!r} outside report pool "
+                    f"({pool}); re-prompting once",
+                    flush=True,
+                )
+                if not args.dry_run:
+                    retry_prompt = leader_unknown_next_reprompt(
+                        turn=turn,
+                        turns=end_turn,
+                        step=step_index,
+                        steps=steps,
+                        leader=route.leader,
+                        invalid_next=invalid,
+                        workers=route.workers,
+                        default_next=default_next,
+                    )
+                    prompt_and_wait(
+                        args.herdr,
+                        route.leader,
+                        retry_prompt,
+                        timeout_ms=args.timeout_ms,
+                        env=cli_env,
+                    )
+                    retry_text = agent_read_text(
+                        args.herdr, route.leader, env=cli_env
+                    )
+                    prior = ""
+                    if step_leader_path.is_file():
+                        prior = step_leader_path.read_text(encoding="utf-8")
+                    step_leader_path.write_text(
+                        prior.rstrip()
+                        + "\n\n## NEXT retry\n\n"
+                        + retry_text
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    directive = parse_leader_directive_after_unknown_retry(
+                        directive,
+                        retry_text,
+                        workers=route.workers,
+                        default_next=default_next,
+                    )
+                    next_after = (
+                        directive.unknown_next
+                        if directive.unknown_next
+                        else directive.next_agent
+                    )
+                    steps_log.append(
+                        f"- NEXT_AFTER_RETRY: `{next_after}`\n"
+                        f"- ROLE_AFTER_RETRY: "
+                        f"`{directive.role or '_(none)_'}`\n"
+                        f"- STATUS_AFTER_RETRY: `{directive.status}`\n"
+                    )
+                    if directive.unknown_next:
+                        steps_log.append(
+                            f"- NEXT_ERROR_AFTER_RETRY: "
+                            f"`{directive.unknown_next}` still outside "
+                            f"report pool; no default_next fallback\n"
+                        )
 
             if directive.status in {"DONE", "STOP", "ESCALATE"}:
                 note = (
@@ -1073,6 +1360,17 @@ def run_leader_hub_turns(
                     exit_code = 1
                 break
 
+            if directive.unknown_next:
+                pool = ", ".join(route.workers)
+                msg = (
+                    f"leader NEXT {directive.unknown_next!r} is outside the "
+                    f"report pool ({pool}) after retry; refusing to fall "
+                    f"back to default NEXT {default_next!r}"
+                )
+                print(f"warning: {msg}", flush=True)
+                hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
+                raise RuntimeError(msg)
+
             worker = directive.next_agent or default_next
             if worker.casefold() == route.leader.casefold():
                 raise RuntimeError(
@@ -1085,11 +1383,22 @@ def run_leader_hub_turns(
                 )
             # Canonical spelling
             worker = next(w for w in route.workers if w.casefold() == worker.casefold())
+            role = normalize_hub_role(directive.role)
             instruction = (directive.instruction or "").strip()
             if not instruction:
                 instruction = (
                     f"Continue the overall goal ({args.goal}) from your role "
                     f"`{worker}`. Leave a clear on-screen summary when done."
+                )
+            instruction = prepend_role_to_instruction(instruction, role)
+
+            prior_summary: str | None = None
+            prior_agent = last_agent if step_index > 1 else None
+            prior_role = last_role if step_index > 1 else None
+            if step_index > 1:
+                prior_summary = summarize_prior_worker_handoff(
+                    screen_text=last_output,
+                    notes_path=last_notes_path,
                 )
 
             assignment = worker_assignment_prompt(
@@ -1102,6 +1411,10 @@ def run_leader_hub_turns(
                 goal=args.goal,
                 workdir=workdir,
                 instruction=instruction,
+                role=role,
+                prior_agent=prior_agent,
+                prior_role=prior_role,
+                prior_summary=prior_summary,
             )
             print(
                 f"======== TURN {turn}/{end_turn}: "
@@ -1121,14 +1434,19 @@ def run_leader_hub_turns(
                 )
                 last_output = agent_read_text(args.herdr, worker, env=cli_env)
             last_agent = worker
+            last_role = role
             worker_snap = notes_dir / f"TURN{turn}_WORKER_{worker}_STEP{step_index}.md"
+            role_note = role or "_(none)_"
             worker_snap.write_text(
-                f"# Turn {turn} worker `{worker}` step {step_index}\n\n"
+                f"# Turn {turn} worker `{worker}` step {step_index}\n"
+                f"ROLE: {role_note}\n\n"
                 f"{last_output}\n",
                 encoding="utf-8",
             )
+            last_notes_path = worker_snap
             steps_log.append(
-                f"- worker `{worker}` snapshot → `{worker_snap.name}`\n"
+                f"- worker `{worker}` ROLE `{role_note}` "
+                f"snapshot → `{worker_snap.name}`\n"
             )
 
         hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
@@ -4177,6 +4495,127 @@ def list_current_tab_panes_visual(
     return ordered
 
 
+def pane_display_label(pane: dict[str, Any]) -> str | None:
+    """Return a non-empty pane label, or None."""
+    label = pane.get("label")
+    if isinstance(label, str) and label.strip():
+        return label.strip()
+    return None
+
+
+def hub_target_name(
+    *,
+    agent_name: str | None,
+    pane_label: str | None,
+) -> str | None:
+    """Prefer live agent name; fall back to pane label (pane→agent bind)."""
+    if isinstance(agent_name, str) and agent_name.strip():
+        return agent_name.strip()
+    if isinstance(pane_label, str) and pane_label.strip():
+        return pane_label.strip()
+    return None
+
+
+def list_pane_labels_by_id(
+    herdr: str,
+    pane_ids: list[str],
+    *,
+    env: dict[str, str | None] | None = None,
+) -> dict[str, str]:
+    """Map pane_id → label for panes that have a non-empty label."""
+    wanted = {pid for pid in pane_ids if pid}
+    if not wanted:
+        return {}
+    payload = herdr_json(herdr, ["pane", "list"], env=env)
+    panes = (
+        payload.get("result", {}).get("panes")
+        or payload.get("panes")
+        or []
+    )
+    out: dict[str, str] = {}
+    for pane in panes:
+        if not isinstance(pane, dict):
+            continue
+        pid = str(pane.get("pane_id") or "").strip()
+        if pid not in wanted:
+            continue
+        label = pane_display_label(pane)
+        if label:
+            out[pid] = label
+    return out
+
+
+def try_agent_rename(
+    herdr: str,
+    pane_id: str,
+    name: str,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> bool:
+    """Best-effort ``agent rename``; return True on success.
+
+    ``agent_not_found`` (empty shell / no agent yet) is quiet and returns False.
+    Other failures print a warning and return False.
+    """
+    try:
+        herdr_json(herdr, ["agent", "rename", pane_id, name], env=env)
+        return True
+    except RuntimeError as err:
+        if "agent_not_found" not in str(err):
+            print(
+                f"warning: agent rename {pane_id} → {name}: {err}",
+                flush=True,
+            )
+        return False
+
+
+def bind_pane_labels_to_agents(
+    herdr: str,
+    *,
+    env: dict[str, str | None] | None = None,
+) -> list[tuple[str, str]]:
+    """Align live agent names to pane labels (visual order).
+
+    For each current-tab pane that has a label and a live agent whose name
+    differs (or is empty), attempt ``agent rename`` to the label. Returns the
+    list of ``(pane_id, label)`` pairs that were renamed successfully.
+    """
+    panes = list_current_tab_panes_visual(herdr, env=env)
+    pane_ids = [str(p.get("pane_id")) for p in panes]
+    labels = list_pane_labels_by_id(herdr, pane_ids, env=env)
+    if not labels:
+        return []
+    payload = herdr_json(herdr, ["agent", "list"], env=env)
+    agents = (
+        payload.get("result", {}).get("agents")
+        or payload.get("agents")
+        or []
+    )
+    agent_name_by_pane: dict[str, str] = {}
+    live_panes: set[str] = set()
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        pid = str(agent.get("pane_id") or "").strip()
+        if pid not in pane_ids:
+            continue
+        live_panes.add(pid)
+        name = agent.get("name")
+        if isinstance(name, str) and name.strip():
+            agent_name_by_pane[pid] = name.strip()
+    bound: list[tuple[str, str]] = []
+    for pid in pane_ids:
+        label = labels.get(pid)
+        if not label or pid not in live_panes:
+            continue
+        current = agent_name_by_pane.get(pid)
+        if current == label:
+            continue
+        if try_agent_rename(herdr, pid, label, env=env):
+            bound.append((pid, label))
+    return bound
+
+
 def require_turn_init_single_pane(panes: list[dict[str, Any]]) -> str:
     """Require exactly one pane in the current tab; return its pane_id.
 
@@ -4341,15 +4780,30 @@ def run_turn_init(
 
     for pane_id, name in assignments:
         print(f"  {pane_id} → {name}", flush=True)
+        # Pane labels work on empty shells; agent rename only when an agent exists.
         try:
-            herdr_json(herdr, ["agent", "rename", pane_id, name], env=env)
+            herdr_run(
+                herdr,
+                ["pane", "rename", pane_id, name],
+                env=env,
+                allow_empty=True,
+            )
         except RuntimeError as err:
             print(
-                f"error: failed to rename {pane_id} → {name}: {err}",
+                f"error: failed to pane-rename {pane_id} → {name}: {err}",
                 file=sys.stderr,
             )
             return 1
+        # Empty panes after split have no agent yet — pane label is enough;
+        # /turn-run re-binds live agents to labels via bind_pane_labels_to_agents.
+        try_agent_rename(herdr, pane_id, name, env=env)
     print("next:", format_turn_init_launch_hint(names), flush=True)
+    print(
+        "hint: start agents with the pane label as NAME "
+        "(`herdr agent start <label> --kind … --pane <pane>`), "
+        "or let /turn-run bind labels→agent names automatically",
+        flush=True,
+    )
     return 0
 
 
@@ -4505,9 +4959,13 @@ def resolve_hub_targets_from_current_tab(
 ) -> tuple[str, list[str]]:
     """Return ``(leader_name, report_names)`` from the current tab.
 
-    Leader is the named agent in ``HERDR_PANE_ID``. Reports are other named
-    agents in the same tab, ordered top-left → bottom-right. Requires prior
-    ``turn-init`` (or equivalent renames).
+    Leader is the hub target for ``HERDR_PANE_ID``. Reports are other hub
+    targets in the same tab, ordered top-left → bottom-right.
+
+    Name resolution prefers a live agent name, then falls back to the pane
+    label (so ``turn-init`` pane renames work even before / without agent
+    rename). Prefer running ``bind_pane_labels_to_agents`` first when agents
+    are already live.
     """
     pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
     if not pane_id:
@@ -4523,7 +4981,7 @@ def resolve_hub_targets_from_current_tab(
         or payload.get("agents")
         or []
     )
-    named_by_pane: dict[str, str] = {}
+    agent_name_by_pane: dict[str, str] = {}
     for agent in agents:
         if not isinstance(agent, dict):
             continue
@@ -4532,7 +4990,16 @@ def resolve_hub_targets_from_current_tab(
             continue
         name = agent.get("name")
         if isinstance(name, str) and name.strip():
-            named_by_pane[pid] = name.strip()
+            agent_name_by_pane[pid] = name.strip()
+    labels_by_pane = list_pane_labels_by_id(herdr, pane_ids, env=env)
+    named_by_pane: dict[str, str] = {}
+    for pid in pane_ids:
+        name = hub_target_name(
+            agent_name=agent_name_by_pane.get(pid),
+            pane_label=labels_by_pane.get(pid),
+        )
+        if name:
+            named_by_pane[pid] = name
     if pane_id not in pane_ids:
         raise RuntimeError(
             f"turn-run: current pane {pane_id} is not in the current tab layout"
@@ -4540,7 +5007,7 @@ def resolve_hub_targets_from_current_tab(
     leader = named_by_pane.get(pane_id)
     if not leader:
         raise RuntimeError(
-            f"turn-run: pane {pane_id} has no agent name — "
+            f"turn-run: pane {pane_id} has no agent name or pane label — "
             "run `herdr-turns turn-init leader,report1,...` first"
         )
     reports: list[str] = []
@@ -4552,8 +5019,8 @@ def resolve_hub_targets_from_current_tab(
             reports.append(name)
     if not reports:
         raise RuntimeError(
-            "turn-run: no other named agents in this tab — "
-            "split panes, start agents, then turn-init"
+            "turn-run: no other named agents or labeled panes in this tab — "
+            "split panes, turn-init (labels), then start agents"
         )
     if len(reports) > MAX_HUB_WORKERS:
         raise RuntimeError(
@@ -4608,6 +5075,10 @@ def run_turn_run(
     """Start leader-hub turns from the current (leader) pane."""
     try:
         turns, goal = parse_turn_run_spec(spec_raw)
+        # After agents start on labeled panes, align agent names to labels.
+        bound = bind_pane_labels_to_agents(herdr, env=env)
+        for pane_id, label in bound:
+            print(f"turn-run: bound agent on {pane_id} → {label}", flush=True)
         leader, reports = resolve_hub_targets_from_current_tab(herdr, env=env)
     except (ValueError, RuntimeError) as err:
         print(str(err), file=sys.stderr)
