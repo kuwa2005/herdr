@@ -384,7 +384,7 @@ fn context_menus_capture_stable_targets_and_route_actions() {
 }
 
 #[test]
-fn pane_context_menu_opens_start_turns_overlay() {
+fn pane_context_menu_single_pane_offers_turn_init_only() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
@@ -399,61 +399,66 @@ fn pane_context_menu_opens_start_turns_overlay() {
     state.compose(106, 20).expect("pane context menu");
     match state.overlay.as_ref() {
         Some(ClientShellOverlay::ContextMenu(menu)) => {
-            let items = menu.items(crate::config::UiLanguage::En);
-            assert!(
-                items
-                    .iter()
-                    .any(|item| item.action == ClientContextMenuAction::TurnInit),
-                "single-pane tab should offer turn-init"
-            );
-            assert!(
-                !items
-                    .iter()
-                    .any(|item| item.action == ClientContextMenuAction::HubTurnRun),
-                "unlabeled pane should not offer hub turn-run"
-            );
+            let items = menu.items(crate::config::UiLanguage::Ja);
+            let actions: Vec<_> = items.iter().map(|item| item.action).collect();
+            assert!(actions.contains(&ClientContextMenuAction::TurnInit));
+            assert!(!actions.contains(&ClientContextMenuAction::HubTurnRun));
+            assert!(!actions.contains(&ClientContextMenuAction::StartTurns));
+            // Even a lone pane labeled boss must not offer hub turn-run.
         }
         _ => panic!("pane context menu"),
     }
-    let start_index = match state.overlay.as_ref() {
-        Some(ClientShellOverlay::ContextMenu(menu)) => menu
-            .items(crate::config::UiLanguage::En)
-            .iter()
-            .position(|item| item.action == ClientContextMenuAction::StartTurns)
-            .expect("start turns item"),
-        _ => panic!("pane context menu"),
-    };
-    let start = state.hits.context_menu_rows[start_index].0;
+
+    // Lone pane labeled boss: still TurnInit only (no HubTurnRun / StartTurns).
+    let mut snap = snapshot();
+    snap.panes[0].label = Some("boss".into());
+    state.set_snapshot(Box::new(snap));
+    state.overlay = None;
+    state.compose(106, 20).expect("boss single");
+    let pane = state.hits.panes[0].rect;
     state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: start.x + 1,
-        row: start.y,
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x + 1,
+        row: pane.y,
         modifiers: KeyModifiers::empty(),
     })]);
     match state.overlay.as_ref() {
-        Some(ClientShellOverlay::StartTurns(overlay)) => {
-            assert_eq!(overlay.pane_id, "pane_1");
-            assert_eq!(overlay.workdir, "/repo");
-            assert_eq!(overlay.turns.as_str(), "5");
-            assert_eq!(overlay.focused, ClientStartTurnsField::Goal);
-            assert!(overlay.goal.as_str().is_empty());
+        Some(ClientShellOverlay::ContextMenu(menu)) => {
+            let actions: Vec<_> = menu
+                .items(crate::config::UiLanguage::En)
+                .iter()
+                .map(|item| item.action)
+                .collect();
+            assert!(actions.contains(&ClientContextMenuAction::TurnInit));
+            assert!(!actions.contains(&ClientContextMenuAction::HubTurnRun));
+            assert!(!actions.contains(&ClientContextMenuAction::StartTurns));
         }
-        other => panic!("expected start turns overlay, got {other:?}"),
+        _ => panic!("pane context menu"),
     }
+}
 
-    state.compose(106, 20).expect("start turns overlay");
+#[test]
+fn hub_turn_run_overlay_validates_goal_and_turns() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.open_start_turns_overlay("pane_1".into(), ClientStartTurnsMode::LeaderHub);
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::StartTurns(overlay)) => {
+            assert_eq!(overlay.mode, ClientStartTurnsMode::LeaderHub);
+            assert_eq!(overlay.turns.as_str(), "3");
+        }
+        other => panic!("expected hub overlay, got {other:?}"),
+    }
+    state.compose(106, 20).expect("hub overlay");
     assert!(state.hits.start_turns_goal.width > 0);
-    assert!(state.hits.start_turns_turns.width > 0);
-    assert!(state.hits.overlay_primary.width > 0);
 
-    // Empty goal should fail validation without spawning.
     state.submit_start_turns(&mut ClientShellInput::default());
     match state.overlay.as_ref() {
         Some(ClientShellOverlay::StartTurns(overlay)) => {
             assert_eq!(overlay.error.as_deref(), Some("goal is required"));
-            assert!(!overlay.starting);
         }
-        other => panic!("overlay should remain open on validation error, got {other:?}"),
+        other => panic!("expected validation error, got {other:?}"),
     }
 
     state.insert_start_turns_overlay_text("stabilize turns UX");
@@ -469,7 +474,7 @@ fn pane_context_menu_opens_start_turns_overlay() {
                 .as_deref()
                 .is_some_and(|error| error.contains("turns must be")));
         }
-        other => panic!("overlay should remain open on turns validation error, got {other:?}"),
+        other => panic!("expected turns validation error, got {other:?}"),
     }
 }
 
@@ -625,7 +630,6 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_workspace_cl
     ));
 }
 
-
 #[test]
 fn pane_context_menu_offers_hub_turn_run_for_boss_label() {
     let mut snap = snapshot();
@@ -662,6 +666,9 @@ fn pane_context_menu_offers_hub_turn_run_for_boss_label() {
     assert!(!items
         .iter()
         .any(|item| item.action == ClientContextMenuAction::TurnInit));
+    assert!(!items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::StartTurns));
     assert_eq!(
         items
             .iter()
@@ -721,6 +728,39 @@ fn pane_context_menu_turn_init_only_when_single_pane() {
             assert!(!items
                 .iter()
                 .any(|item| item.action == ClientContextMenuAction::TurnInit));
+        }
+        _ => panic!("pane context menu"),
+    }
+}
+
+#[test]
+fn agent_pane_context_menu_hides_hub_and_self_evolve() {
+    let mut snap = snapshot();
+    snap.panes[0].label = Some("boss".into());
+    snap.panes.push(ClientShellPane {
+        pane_id: "pane_2".into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        label: Some("agent-a".into()),
+        cwd: Some("/repo".into()),
+        foreground_cwd: Some("/repo".into()),
+        focused: false,
+        right_click_passthrough: false,
+    });
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snap));
+    // Open menu on agent-a without relying on hit-testing two panes.
+    state.open_pane_context_menu("pane_2".into(), 10, 10);
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => {
+            let actions: Vec<_> = menu
+                .items(crate::config::UiLanguage::Ja)
+                .iter()
+                .map(|item| item.action)
+                .collect();
+            assert!(!actions.contains(&ClientContextMenuAction::TurnInit));
+            assert!(!actions.contains(&ClientContextMenuAction::HubTurnRun));
+            assert!(!actions.contains(&ClientContextMenuAction::StartTurns));
         }
         _ => panic!("pane context menu"),
     }

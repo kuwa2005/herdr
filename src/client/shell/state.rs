@@ -449,6 +449,8 @@ pub(super) enum ClientStartTurnsField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClientStartTurnsMode {
     /// Nested director/coder/reviewer via ``herdr-turns --from-here``.
+    /// Reserved: overlay path kept for tests/CLI; not shown in the pane menu.
+    #[allow(dead_code)] // constructed only from tests / future CLI re-entry
     FromHere,
     /// Leader-hub via ``herdr-turns turn-run`` (no slash commands).
     LeaderHub,
@@ -558,6 +560,8 @@ pub(super) enum ClientContextMenuAction {
     SplitDown,
     Zoom,
     ToggleRightClickPassthrough,
+    /// Removed from pane menus; kept so negative tests can assert absence.
+    #[allow(dead_code)]
     StartTurns,
     TurnInit,
     HubTurnRun,

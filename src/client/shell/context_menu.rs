@@ -93,14 +93,14 @@ impl ClientContextMenuOverlay {
                         Action::ToggleRightClickPassthrough,
                     ),
                 ]);
-                // Leader-hub: avoid slash commands that agents treat as prompts.
+                // Leader-hub only (no self-evolve / slash-command menu entries).
                 if *single_pane_tab {
                     items.push(item(Msg::CtxTurnInit, Action::TurnInit));
                 }
-                if *is_hub_leader {
+                // Boss pane after init (multi-pane tab). Never on a lone pane.
+                if *is_hub_leader && !*single_pane_tab {
                     items.push(item(Msg::CtxHubTurnRun, Action::HubTurnRun));
                 }
-                items.push(item(Msg::CtxStartTurns, Action::StartTurns));
                 items.push(item(Msg::CtxClosePane, Action::ClosePane));
                 items
             }
@@ -496,10 +496,6 @@ impl ClientShellState {
                 }),
                 outcome,
             ),
-            ClientContextMenuAction::StartTurns => {
-                self.open_start_turns_overlay(pane_id, ClientStartTurnsMode::FromHere);
-                outcome.repaint = true;
-            }
             ClientContextMenuAction::TurnInit => {
                 self.run_turn_init(pane_id, outcome);
             }
