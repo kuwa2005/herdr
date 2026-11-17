@@ -127,6 +127,20 @@ STATUS: CONTINUE
 
 `/turn-init` は分割直後に **pane ラベル**を付ける（agent 未起動なら agent rename はスキップ）。各ペインで AI を起動したあと `/turn-run` が **bind** し、pane ラベルを生きている agent 名へ揃える。名前解決は agent 名優先、無ければ pane ラベル。
 
+### 実行中のペイン表示名（AI/役割）
+
+ハブ実行中、部下ペインの **pane ラベル**は検出された AI 種別に役割を付けた形になります（例: `cursor/検証役`、`claude/実装`）。
+
+| 時点 | 表示 |
+| --- | --- |
+| turn-init / 待機中 | `agent-a` / `agent-b` / `agent-c`（boss は `boss`） |
+| turn-run 開始直後 | まず `cursor` のように **AI 種別のみ** |
+| リーダーが `ROLE:` を任命したステップ | `cursor/検証役` のように **AI/役割** |
+| ハブ終了（成功・中断・例外） | 再び `agent-a` / `agent-b` / `agent-c`（と `boss`） |
+
+- `NEXT:` は常にスロット名（`agent-a` など）。表示ラベルは変えてもルーティング名は変えない
+- agent rename は英数字のみなので、スラッシュ付き表示は **pane ラベル**側に載せる
+
 ### 直前手渡し（prior handoff）
 
 同じターンのステップ 2 以降、次の部下の assignment に直前部下の名前・ROLE・要約（notes 優先、なければ画面）を付ける。ステップ 1 は `_(なし)_`。

@@ -3528,6 +3528,115 @@ class TurnRunTests(unittest.TestCase):
 
 
 
+    def test_hub_duty_label_helpers(self) -> None:
+        self.assertEqual(
+            turns.format_hub_duty_label("cursor", "検証役"),
+            "cursor/検証役",
+        )
+        self.assertEqual(turns.format_hub_duty_label("claude", None), "claude")
+        self.assertEqual(
+            turns.format_hub_duty_label("cursor", "a/b"),
+            "cursor/a·b",
+        )
+        self.assertEqual(
+            turns.hub_agent_kind({"agent": "claude-code"}),
+            "claude",
+        )
+        self.assertEqual(
+            turns.hub_agent_kind({"agent": "github-copilot"}),
+            "copilot",
+        )
+        self.assertEqual(turns.hub_agent_kind({}), "agent")
+
+    def test_map_hub_slots_and_kinds(self) -> None:
+        layout = [
+            {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0}},
+            {"pane_id": "w1:p2", "rect": {"x": 10, "y": 0}},
+            {"pane_id": "w1:p3", "rect": {"x": 0, "y": 10}},
+        ]
+        agents = [
+            {"pane_id": "w1:p1", "name": "boss", "agent": "cursor"},
+            {"pane_id": "w1:p2", "name": "agent-a", "agent": "claude-code"},
+            {"pane_id": "w1:p3", "name": "agent-b", "agent": "codex"},
+        ]
+        labeled = [
+            {"pane_id": "w1:p1", "label": "boss"},
+            {"pane_id": "w1:p2", "label": "agent-a"},
+            {"pane_id": "w1:p3", "label": "agent-b"},
+        ]
+        fake = self._fake_hub_json_factory(
+            layout_panes=layout,
+            agents=agents,
+            labeled_panes=labeled,
+        )
+        with mock.patch.object(turns, "herdr_json", side_effect=fake):
+            slots = turns.map_hub_slots_to_panes(
+                "herdr", ["boss", "agent-a", "agent-b"]
+            )
+            kinds = turns.map_hub_pane_kinds(
+                "herdr", list(slots.values())
+            )
+        self.assertEqual(
+            slots,
+            {"boss": "w1:p1", "agent-a": "w1:p2", "agent-b": "w1:p3"},
+        )
+        self.assertEqual(kinds["w1:p2"], "claude")
+        self.assertEqual(kinds["w1:p3"], "codex")
+
+    def test_apply_and_restore_hub_duty_pane_labels(self) -> None:
+        pane_renames: list[tuple[str, str]] = []
+
+        def fake_run(herdr, argv, env=None, allow_empty=False):
+            del herdr, env, allow_empty
+            if argv[:2] == ["pane", "rename"]:
+                pane_renames.append((argv[2], argv[3]))
+                return None
+            raise AssertionError(argv)
+
+        with mock.patch.object(turns, "herdr_run", side_effect=fake_run):
+            label = turns.apply_hub_duty_pane_label(
+                "herdr",
+                "w1:p2",
+                kind="cursor",
+                role="検証役",
+            )
+            self.assertEqual(label, "cursor/検証役")
+            turns.restore_hub_slot_pane_labels(
+                "herdr",
+                {"agent-a": "w1:p2", "agent-b": "w1:p3"},
+            )
+        self.assertEqual(
+            pane_renames,
+            [
+                ("w1:p2", "cursor/検証役"),
+                ("w1:p2", "agent-a"),
+                ("w1:p3", "agent-b"),
+            ],
+        )
+
+    def test_leader_briefing_mentions_duty_pane_labels(self) -> None:
+        route = turns.LeaderHubRoute(
+            leader="boss",
+            workers=["agent-a", "agent-b"],
+            order=["agent-a", "agent-b"],
+        )
+        prompt = turns.leader_briefing_prompt(
+            turn=1,
+            turns=2,
+            step=1,
+            steps=2,
+            route=route,
+            goal="g",
+            workdir=Path("/tmp"),
+            notes_dir=Path("/tmp/notes"),
+            default_next="agent-a",
+            last_agent=None,
+            last_output="(start)",
+        )
+        self.assertIn("slot names", prompt)
+        self.assertIn("AI/role", prompt)
+
+
 class AutoYesTests(unittest.TestCase):
     def test_looks_like_yes_proceed_prompt(self) -> None:
         sample = (
