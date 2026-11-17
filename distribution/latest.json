@@ -11,7 +11,7 @@
     "windows-x86_64": "https://github.com/kuwa2005/herdr/releases/download/v0.9.8/herdr-windows-x86_64.zip"
   },
   "sha256": {
-    "linux-x86_64": "bc66175993335002625d121c436c95698a995a6ed97074a57b08fafe585f44fb",
+    "linux-x86_64": "a797be277c98784a37b0b24457a7c7e941317fc4534e6bd0f4c900993052434b",
     "linux-aarch64": "b04fc2291cbaf7144d40a6f457aba201b71e258473ebb88493be9ab61affe06a",
     "macos-x86_64": "c659fc806c4d9914ff0c186a1efcbee74085de174595e26066d8cbf1a02b84b1",
     "macos-aarch64": "4bc98f374049ec8a0a0d446bb2a946cdbf4328d3be8deebf031a09d4cf921419",
