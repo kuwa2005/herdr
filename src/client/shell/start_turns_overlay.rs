@@ -6,7 +6,11 @@ pub(super) fn render_start_turns_overlay(
     language: crate::config::UiLanguage,
     p: &Palette,
 ) -> Option<OverlayRender> {
-    let title = crate::i18n::t(language, crate::i18n::Msg::CtxStartTurns)
+    let title_msg = match start.mode {
+        ClientStartTurnsMode::FromHere => crate::i18n::Msg::CtxStartTurns,
+        ClientStartTurnsMode::LeaderHub => crate::i18n::Msg::CtxHubTurnRun,
+    };
+    let title = crate::i18n::t(language, title_msg)
         .trim_end_matches("...")
         .trim_end_matches('…');
     let popup = popup(b.area, 72, 14)?;

@@ -446,10 +446,19 @@ pub(super) enum ClientStartTurnsField {
     Turns,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClientStartTurnsMode {
+    /// Nested director/coder/reviewer via ``herdr-turns --from-here``.
+    FromHere,
+    /// Leader-hub via ``herdr-turns turn-run`` (no slash commands).
+    LeaderHub,
+}
+
 #[derive(Debug)]
 pub(super) struct ClientStartTurnsOverlay {
     pub(super) pane_id: String,
     pub(super) workdir: String,
+    pub(super) mode: ClientStartTurnsMode,
     pub(super) goal: TextEditor,
     pub(super) turns: TextEditor,
     pub(super) focused: ClientStartTurnsField,
@@ -550,6 +559,8 @@ pub(super) enum ClientContextMenuAction {
     Zoom,
     ToggleRightClickPassthrough,
     StartTurns,
+    TurnInit,
+    HubTurnRun,
     ClosePane,
 }
 
@@ -573,6 +584,8 @@ pub(super) enum ClientContextMenuTarget {
         source_pane_id: Option<String>,
         has_manual_label: bool,
         right_click_passthrough: bool,
+        single_pane_tab: bool,
+        is_hub_leader: bool,
     },
 }
 

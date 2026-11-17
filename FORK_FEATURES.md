@@ -34,19 +34,21 @@ Herdr 管理ペイン内では `HERDR_ENV=1` / `HERDR_PANE_ID` が付きます�
 
 自己進化の `--from-here`（director/coder/reviewer ネスト）とは**別経路**です。
 
-### クイックスタート
+### クイックスタート（推奨: 右クリックメニュー）
 
-1. **シングルペイン**のタブにいる（既に分割済みだと `/turn-init` は拒否）
-2. 各ペインで使う AI は、分割後に手動起動してよい（命名は init が行う）
-3. 初期化 → ハブ開始:
+スラッシュ付き `/turn-init` などはエージェントへの指示と誤解されやすいので、**ペイン右クリック**から起動してください。
+
+1. **シングルペイン**のタブでペインを右クリック → **ターン制を初期化**
+   - 2×2 分割 + 既定名 `boss, agent-a, agent-b, agent-c`
+2. 各ペインで AI を起動（命名は init 済み。`/turn-run` 相当は bind で揃える）
+3. **boss** ペインを右クリック → **ターン開始...** → 目的とターン数を入力
+
+CLI（スラッシュ無し）でも同じことができます:
 
 ```bash
-# シングルペインから 2x2 分割 + 既定名を付与
-# 既定: boss, agent-a, agent-b, agent-c（左上→右下）
-herdr-turns /turn-init
-
-# リーダーペインにフォーカスした状態で
-herdr-turns /turn-run 3,"ここに目的"
+herdr-turns turn-init
+# boss ペインの環境で:
+herdr-turns turn-run 3,"ここに目的"
 ```
 
 ### `/turn-init` — 分割と名前付け
@@ -181,8 +183,8 @@ herdr-turns --from-here --daemon --turns 5 \
 
 | やりたいこと | コマンド |
 | --- | --- |
-| シングルペインから 2×2 + 命名 | `herdr-turns /turn-init` |
-| リーダーハブ開始 | `herdr-turns /turn-run 3,"目的"` |
+| シングルペインから 2×2 + 命名 | 右クリック「ターン制を初期化」または `herdr-turns turn-init` |
+| リーダーハブ開始 | boss 右クリック「ターン開始...」または `herdr-turns turn-run 3,"目的"` |
 | 確認を自動 Yes | `herdr-turns /auto-yes` |
 | auto-yes 状態 | `herdr-turns auto-yes status` |
 | ネスト自己進化 | `herdr-turns --from-here --daemon --turns N --goal "..." --workdir "$PWD"` |

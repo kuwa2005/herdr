@@ -68,6 +68,8 @@ pub enum Msg {
     CtxUseHerdrRightClick,
     CtxSendRightClicksToPane,
     CtxStartTurns,
+    CtxTurnInit,
+    CtxHubTurnRun,
     CtxClosePane,
 }
 
@@ -133,7 +135,9 @@ fn en(msg: Msg) -> &'static str {
         Msg::CtxZoom => "Zoom",
         Msg::CtxUseHerdrRightClick => "Use Herdr right-click menu",
         Msg::CtxSendRightClicksToPane => "Send right-clicks to pane",
-        Msg::CtxStartTurns => "Start turn loop...",
+        Msg::CtxStartTurns => "Start self-evolve loop...",
+        Msg::CtxTurnInit => "Initialize turn grid",
+        Msg::CtxHubTurnRun => "Start hub turns...",
         Msg::CtxClosePane => "Close pane",
     }
 }
@@ -191,7 +195,9 @@ fn ja(msg: Msg) -> Option<&'static str> {
         Msg::CtxZoom => "ズーム",
         Msg::CtxUseHerdrRightClick => "Herdr の右クリックメニューを使う",
         Msg::CtxSendRightClicksToPane => "右クリックをペインに送る",
-        Msg::CtxStartTurns => "ターン制を開始...",
+        Msg::CtxStartTurns => "自己進化ループ...",
+        Msg::CtxTurnInit => "ターン制を初期化",
+        Msg::CtxHubTurnRun => "ターン開始...",
         Msg::CtxClosePane => "ペインを閉じる",
     })
 }
@@ -249,7 +255,9 @@ fn zh_cn(msg: Msg) -> Option<&'static str> {
         Msg::CtxZoom => "缩放",
         Msg::CtxUseHerdrRightClick => "使用 Herdr 右键菜单",
         Msg::CtxSendRightClicksToPane => "将右键发送到窗格",
-        Msg::CtxStartTurns => "开始回合循环...",
+        Msg::CtxStartTurns => "自我进化循环...",
+        Msg::CtxTurnInit => "初始化回合网格",
+        Msg::CtxHubTurnRun => "开始回合...",
         Msg::CtxClosePane => "关闭窗格",
     })
 }
@@ -266,11 +274,14 @@ mod tests {
             Msg::SettingsTabLanguage,
             Msg::CtxClosePane,
             Msg::CtxStartTurns,
+            Msg::CtxTurnInit,
+            Msg::CtxHubTurnRun,
         ] {
             assert!(!t(UiLanguage::En, msg).is_empty());
         }
-        assert_eq!(t(UiLanguage::Ja, Msg::CtxStartTurns), "ターン制を開始...");
-        assert_eq!(t(UiLanguage::ZhCn, Msg::CtxStartTurns), "开始回合循环...");
+        assert_eq!(t(UiLanguage::Ja, Msg::CtxTurnInit), "ターン制を初期化");
+        assert_eq!(t(UiLanguage::Ja, Msg::CtxHubTurnRun), "ターン開始...");
+        assert_eq!(t(UiLanguage::ZhCn, Msg::CtxTurnInit), "初始化回合网格");
     }
 
     #[test]

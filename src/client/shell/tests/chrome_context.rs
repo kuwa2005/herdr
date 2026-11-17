@@ -397,6 +397,24 @@ fn pane_context_menu_opens_start_turns_overlay() {
         modifiers: KeyModifiers::empty(),
     })]);
     state.compose(106, 20).expect("pane context menu");
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => {
+            let items = menu.items(crate::config::UiLanguage::En);
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.action == ClientContextMenuAction::TurnInit),
+                "single-pane tab should offer turn-init"
+            );
+            assert!(
+                !items
+                    .iter()
+                    .any(|item| item.action == ClientContextMenuAction::HubTurnRun),
+                "unlabeled pane should not offer hub turn-run"
+            );
+        }
+        _ => panic!("pane context menu"),
+    }
     let start_index = match state.overlay.as_ref() {
         Some(ClientShellOverlay::ContextMenu(menu)) => menu
             .items(crate::config::UiLanguage::En)
@@ -605,4 +623,105 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_workspace_cl
         crate::api::schema::Method::WorkspaceClose(params)
             if params.workspace_id == "ws_1" && !params.close_group
     ));
+}
+
+
+#[test]
+fn pane_context_menu_offers_hub_turn_run_for_boss_label() {
+    let mut snap = snapshot();
+    snap.panes[0].label = Some("boss".into());
+    // Simulate a multi-pane tab so TurnInit is hidden and HubTurnRun shows.
+    snap.panes.push(ClientShellPane {
+        pane_id: "pane_2".into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        label: Some("agent-a".into()),
+        cwd: Some("/repo".into()),
+        foreground_cwd: Some("/repo".into()),
+        focused: false,
+        right_click_passthrough: false,
+    });
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snap));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed frame");
+    let pane = state.hits.panes[0].rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x + 1,
+        row: pane.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let items = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(crate::config::UiLanguage::Ja),
+        _ => panic!("pane context menu"),
+    };
+    assert!(items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::HubTurnRun));
+    assert!(!items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::TurnInit));
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.action == ClientContextMenuAction::HubTurnRun)
+            .map(|item| item.label),
+        Some("ターン開始...")
+    );
+
+    let hub_index = items
+        .iter()
+        .position(|item| item.action == ClientContextMenuAction::HubTurnRun)
+        .expect("hub item");
+    state.compose(106, 20).expect("menu rows");
+    let hit = state.hits.context_menu_rows[hub_index].0;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.x + 1,
+        row: hit.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::StartTurns(overlay)) => {
+            assert_eq!(overlay.mode, ClientStartTurnsMode::LeaderHub);
+            assert_eq!(overlay.turns.as_str(), "3");
+        }
+        other => panic!("expected hub start overlay, got {other:?}"),
+    }
+}
+
+#[test]
+fn pane_context_menu_turn_init_only_when_single_pane() {
+    let mut snap = snapshot();
+    snap.panes.push(ClientShellPane {
+        pane_id: "pane_2".into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        label: None,
+        cwd: Some("/repo".into()),
+        foreground_cwd: Some("/repo".into()),
+        focused: false,
+        right_click_passthrough: false,
+    });
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snap));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed");
+    let pane = state.hits.panes[0].rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x + 1,
+        row: pane.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => {
+            let items = menu.items(crate::config::UiLanguage::En);
+            assert!(!items
+                .iter()
+                .any(|item| item.action == ClientContextMenuAction::TurnInit));
+        }
+        _ => panic!("pane context menu"),
+    }
 }

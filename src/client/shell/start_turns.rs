@@ -59,6 +59,53 @@ pub(super) fn build_start_turns_launch(
     }
 }
 
+/// Build ``herdr-turns turn-run TURNS,goal`` without slash commands.
+pub(super) fn build_hub_turn_run_launch(
+    pane_id: &str,
+    workdir: &Path,
+    goal: &str,
+    turns: u32,
+    program: &str,
+) -> StartTurnsLaunch {
+    StartTurnsLaunch {
+        program: program.to_owned(),
+        args: vec![
+            "turn-run".into(),
+            format_turn_run_spec(turns, goal),
+            "--notes-dir".into(),
+            workdir.join("hub-notes").display().to_string(),
+        ],
+        env: vec![
+            ("HERDR_ENV".into(), "1".into()),
+            ("HERDR_PANE_ID".into(), pane_id.to_owned()),
+        ],
+        workdir: workdir.to_path_buf(),
+    }
+}
+
+pub(super) fn build_turn_init_launch(
+    pane_id: &str,
+    workdir: &Path,
+    program: &str,
+) -> StartTurnsLaunch {
+    StartTurnsLaunch {
+        program: program.to_owned(),
+        args: vec!["turn-init".into()],
+        env: vec![
+            ("HERDR_ENV".into(), "1".into()),
+            ("HERDR_PANE_ID".into(), pane_id.to_owned()),
+        ],
+        workdir: workdir.to_path_buf(),
+    }
+}
+
+fn format_turn_run_spec(turns: u32, goal: &str) -> String {
+    // Prefer quoted form so commas in the goal stay inside the goal field.
+    // Parser does not support escaped quotes; replace " with '.
+    let safe = goal.replace('"', "'");
+    format!("{turns},\"{safe}\"")
+}
+
 fn spawn_start_turns_launch(launch: &StartTurnsLaunch) -> Result<(), String> {
     let mut command = Command::new(&launch.program);
     command
@@ -79,47 +126,70 @@ fn spawn_start_turns_launch(launch: &StartTurnsLaunch) -> Result<(), String> {
         .map_err(|err| format!("failed to start {}: {err}", launch.program))
 }
 
-impl ClientShellState {
-    pub(super) fn open_start_turns_overlay(&mut self, pane_id: String) {
-        let workdir = self
-            .snapshot
-            .as_deref()
-            .and_then(|snapshot| {
-                snapshot
+fn pane_workdir(state: &ClientShellState, pane_id: &str) -> String {
+    state
+        .snapshot
+        .as_deref()
+        .and_then(|snapshot| {
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .and_then(|pane| pane.foreground_cwd.clone().or_else(|| pane.cwd.clone()))
+        })
+        .or_else(|| {
+            state.snapshot.as_deref().and_then(|snapshot| {
+                let workspace_id = snapshot
                     .panes
                     .iter()
                     .find(|pane| pane.pane_id == pane_id)
-                    .and_then(|pane| pane.foreground_cwd.clone().or_else(|| pane.cwd.clone()))
+                    .map(|pane| pane.workspace_id.as_str())?;
+                snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)
+                    .map(|workspace| workspace.new_workspace_cwd.clone())
+                    .filter(|cwd| !cwd.is_empty())
             })
-            .or_else(|| {
-                self.snapshot.as_deref().and_then(|snapshot| {
-                    let workspace_id = snapshot
-                        .panes
-                        .iter()
-                        .find(|pane| pane.pane_id == pane_id)
-                        .map(|pane| pane.workspace_id.as_str())?;
-                    snapshot
-                        .workspaces
-                        .iter()
-                        .find(|workspace| workspace.workspace_id == workspace_id)
-                        .map(|workspace| workspace.new_workspace_cwd.clone())
-                        .filter(|cwd| !cwd.is_empty())
-                })
-            })
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|_| ".".into())
-            });
+        })
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| ".".into())
+        })
+}
+
+impl ClientShellState {
+    pub(super) fn open_start_turns_overlay(&mut self, pane_id: String, mode: ClientStartTurnsMode) {
+        let workdir = pane_workdir(self, &pane_id);
+        let default_turns = match mode {
+            ClientStartTurnsMode::FromHere => START_TURNS_DEFAULT,
+            ClientStartTurnsMode::LeaderHub => 3,
+        };
         self.overlay = Some(ClientShellOverlay::StartTurns(ClientStartTurnsOverlay {
             pane_id,
             workdir,
+            mode,
             goal: TextEditor::default(),
-            turns: TextEditor::new(&START_TURNS_DEFAULT.to_string(), true),
+            turns: TextEditor::new(&default_turns.to_string(), true),
             focused: ClientStartTurnsField::Goal,
             error: None,
             starting: false,
         }));
+    }
+
+    pub(super) fn run_turn_init(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
+        let workdir = PathBuf::from(pane_workdir(self, &pane_id));
+        let launch = build_turn_init_launch(&pane_id, &workdir, "herdr-turns");
+        match spawn_start_turns_launch(&launch) {
+            Ok(()) => {
+                outcome.repaint = true;
+            }
+            Err(error) => {
+                self.set_endpoint_error(error);
+                outcome.repaint = true;
+            }
+        }
     }
 
     pub(super) fn insert_start_turns_overlay_text(&mut self, text: &str) -> bool {
@@ -211,10 +281,17 @@ impl ClientShellState {
         let turns = start.turns.to_string();
         let pane_id = start.pane_id.clone();
         let workdir = PathBuf::from(&start.workdir);
+        let mode = start.mode;
         match validate_start_turns_form(&goal, &turns) {
             Ok((goal, turns)) => {
-                let launch =
-                    build_start_turns_launch(&pane_id, &workdir, &goal, turns, "herdr-turns");
+                let launch = match mode {
+                    ClientStartTurnsMode::FromHere => {
+                        build_start_turns_launch(&pane_id, &workdir, &goal, turns, "herdr-turns")
+                    }
+                    ClientStartTurnsMode::LeaderHub => {
+                        build_hub_turn_run_launch(&pane_id, &workdir, &goal, turns, "herdr-turns")
+                    }
+                };
                 start.starting = true;
                 start.error = None;
                 outcome.repaint = true;
@@ -286,5 +363,29 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "HERDR_PANE_ID" && v == "w1:p1"));
         assert_eq!(launch.workdir, PathBuf::from("/repo"));
+    }
+
+    #[test]
+    fn build_hub_turn_run_uses_turn_run_subcommand() {
+        let launch = build_hub_turn_run_launch(
+            "w1:p3",
+            Path::new("/repo"),
+            "ペイン間連携",
+            3,
+            "herdr-turns",
+        );
+        assert_eq!(launch.args[0], "turn-run");
+        assert_eq!(launch.args[1], "3,\"ペイン間連携\"");
+        assert!(launch.args.contains(&"--notes-dir".into()));
+        assert!(launch
+            .env
+            .iter()
+            .any(|(k, v)| k == "HERDR_PANE_ID" && v == "w1:p3"));
+    }
+
+    #[test]
+    fn build_turn_init_uses_subcommand_without_slash() {
+        let launch = build_turn_init_launch("w1:p1", Path::new("/repo"), "herdr-turns");
+        assert_eq!(launch.args, vec!["turn-init"]);
     }
 }

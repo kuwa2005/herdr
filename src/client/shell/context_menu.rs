@@ -69,6 +69,8 @@ impl ClientContextMenuOverlay {
                 source_pane_id,
                 has_manual_label,
                 right_click_passthrough,
+                single_pane_tab,
+                is_hub_leader,
                 ..
             } => {
                 let mut items = vec![item(Msg::CtxRenamePane, Action::RenamePane)];
@@ -90,9 +92,16 @@ impl ClientContextMenuOverlay {
                         },
                         Action::ToggleRightClickPassthrough,
                     ),
-                    item(Msg::CtxStartTurns, Action::StartTurns),
-                    item(Msg::CtxClosePane, Action::ClosePane),
                 ]);
+                // Leader-hub: avoid slash commands that agents treat as prompts.
+                if *single_pane_tab {
+                    items.push(item(Msg::CtxTurnInit, Action::TurnInit));
+                }
+                if *is_hub_leader {
+                    items.push(item(Msg::CtxHubTurnRun, Action::HubTurnRun));
+                }
+                items.push(item(Msg::CtxStartTurns, Action::StartTurns));
+                items.push(item(Msg::CtxClosePane, Action::ClosePane));
                 items
             }
         }
@@ -169,6 +178,23 @@ impl ClientShellState {
             .focused_pane_id
             .clone()
             .filter(|focused| focused != &pane_id);
+        let tab_id = pane.tab_id.as_str();
+        let single_pane_tab = snapshot
+            .panes
+            .iter()
+            .filter(|candidate| candidate.tab_id == tab_id)
+            .count()
+            == 1;
+        let agent_name = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == pane_id)
+            .and_then(|agent| agent.name.as_deref());
+        let is_hub_leader = pane
+            .label
+            .as_deref()
+            .or(agent_name)
+            .is_some_and(|name| name == "boss");
         self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
             target: ClientContextMenuTarget::Pane {
                 pane_id,
@@ -176,6 +202,8 @@ impl ClientShellState {
                 source_pane_id,
                 has_manual_label: pane.label.is_some(),
                 right_click_passthrough: pane.right_click_passthrough,
+                single_pane_tab,
+                is_hub_leader,
             },
             x,
             y,
@@ -469,7 +497,14 @@ impl ClientShellState {
                 outcome,
             ),
             ClientContextMenuAction::StartTurns => {
-                self.open_start_turns_overlay(pane_id);
+                self.open_start_turns_overlay(pane_id, ClientStartTurnsMode::FromHere);
+                outcome.repaint = true;
+            }
+            ClientContextMenuAction::TurnInit => {
+                self.run_turn_init(pane_id, outcome);
+            }
+            ClientContextMenuAction::HubTurnRun => {
+                self.open_start_turns_overlay(pane_id, ClientStartTurnsMode::LeaderHub);
                 outcome.repaint = true;
             }
             ClientContextMenuAction::ClosePane => self.request_pane_close(pane_id, outcome),

@@ -300,6 +300,7 @@ fn every_dialog_and_menu_occludes_its_panel_not_the_whole_screen() {
             force_confirmation: false,
         }),
         ClientShellOverlay::StartTurns(ClientStartTurnsOverlay {
+            mode: ClientStartTurnsMode::FromHere,
             pane_id: "pane_1".into(),
             workdir: "/repo".into(),
             goal: TextEditor::default(),
