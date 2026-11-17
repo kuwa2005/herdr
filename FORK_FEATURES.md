@@ -22,16 +22,37 @@ Herdr 管理ペイン内では `HERDR_ENV=1` / `HERDR_PANE_ID` が付きます�
 
 ### 何ができるか
 
-- リーダー 1 名 + 部下（reports）最大 3 名（合計最大 4）
-- **部下の役割は固定しない**（名前は身分だけ。毎回リーダーが `ROLE` / `INSTRUCTION` で役割と作業を割り当てる）
-- 流れ: 部下の TUI を読む → リーダーへ渡す → `NEXT` / `ROLE` / `INSTRUCTION` / `STATUS` → 指名した部下へ投入
-- **ウェーブ並列**: `NEXT: agent-a, agent-b`（または NEXT ブロック複数）で 2 人以上を**同時実行**し、全員完了後に結果をまとめてリーダーへ戻す（合流は直列）
-- ステップ 2 以降は直前ステップ（単一またはウェーブ）の要約（prior handoff）を次へ渡す
+- リーダー 1 名 + 部下（reports）最大 7 名（合計最大 8 ペイン）
+- **部下の役割は固定しない**（名前は身分だけ。毎回リーダーが会社組織図（下記）から `ROLE` を割り当てる）
+- 流れ: 部下の TUI を読む → リーダーへ渡す → `NEXT` / `ROLE` / `MODE` / `INSTRUCTION` / `STATUS` → 指名した部下へ投入
+- **書き込みは直列・読み取りは並列**: 1 ステップ（ウェーブ）内で、ファイルを編集する役割（開発部など）は**1 人ずつ順番に**、編集しない役割（レビュー・テスト実行・調査など）は**同時に**動く。例: 「agent-a が次の機能を実装」しながら「agent-b が前ステップの実装をレビュー」「agent-c が次タスクを調査」
+- 1 ターンのステップ数は既定で `max(部下数, 4)`（`--steps-per-turn` で 1〜12）。部下数で頭打ちにならない
+- ステップ 2 以降は直前ステップ（全メンバー分）の要約（prior handoff）を次へ渡す
 
 ```text
-部下ペイン (最大3) -- read --> リーダー -- NEXT/ROLE/INSTRUCTION --> 部下（1人=直列 / 複数=並列）
+部下ペイン (最大7) -- read --> リーダー -- NEXT/ROLE/MODE/INSTRUCTION --> 部下
+                                           書き込み役: 直列（1 人ずつ）
+                                           読み取り役: 並列（書き込み役とも同時）
                                       \-- prior handoff (前ステップ要約) --/
 ```
+
+### 会社組織図（ROLE に使うキー）
+
+| 部署 | キー / 役割 | 種別 |
+| --- | --- | --- |
+| 経営企画部 | `plan.requirements` 要件定義 / `plan.breakdown` タスク分解 | 読み取り（並列） |
+| 調査部 | `research.codebase` コード調査 / `research.root-cause` 原因調査 / `research.tech` 技術調査 | 読み取り（並列） |
+| 設計部 | `design.architecture` アーキテクト / `design.interface` IF設計 / `design.ux` UI/UX設計 | 読み取り（並列） |
+| 開発部 | `dev.implement` 実装 / `dev.bugfix` バグ修正 / `dev.refactor` リファクタ / `dev.test-impl` テスト実装 | **書き込み（直列）** |
+| 品質保証部 | `qa.review` コードレビュー / `qa.test-run` テスト実行 / `qa.acceptance` 受け入れ確認 | 読み取り（並列） |
+| セキュリティ室 | `sec.audit` セキュリティ監査 | 読み取り（並列） |
+| 運用・インフラ部 | `ops.build` ビルド/CI確認 / `ops.perf` 性能計測 | 読み取り（並列） |
+| ドキュメント部 | `docs.write` ドキュメント作成 | **書き込み（直列）** |
+| ドキュメント部 | `docs.review` 文書校閲 | 読み取り（並列） |
+
+`ROLE` はキーのほか役割名（`コードレビュー`）、`部署/役割`（`開発部/実装`）でも通じます。組織図にない自由記述の役割は、`MODE: read` を付けない限り**書き込み（直列）扱い**です（安全側）。組織図で書き込みの役割に `MODE: read` を付けても直列のままです。
+
+読み取り役には「作業フォルダのファイルを編集しない」指示が付きます（ビルド・テスト実行は可）。並列の安全性はこの指示に依存するので、編集が必要な作業は開発部の役割で割り当ててください。
 
 自己進化の `--from-here`（director/coder/reviewer ネスト）とは**別経路**です。
 
@@ -61,12 +82,14 @@ herdr-turns turn-run 3,"ここに目的"
 | --- | --- |
 | 前提 | **現在タブがシングルペインのみ** |
 | 引数なし | `boss,agent-a,agent-b,agent-c` |
-| 動作 | 名前数に合わせて分割（4 なら 2×2）→ 視覚順（上→下・左→右）で `pane rename`（agent がいれば `agent rename` も） |
+| 数字のみ | `turn-init 6` → `boss,agent-a`〜`agent-e`（2〜8） |
+| 動作 | 名前数に合わせて 2 段のグリッドに分割（4 なら 2×2、6 なら 3×2、8 なら 4×2。列幅は均等）→ 視覚順（上→下・左→右）で `pane rename`（agent がいれば `agent rename` も） |
 | dry-run | 分割・改名はしない |
 
 ```bash
 herdr-turns /turn-init
 herdr-turns turn-init boss,agent-a,agent-b      # 3 名にしたいとき
+herdr-turns turn-init 8                         # boss + 部下 7 名（4×2）
 herdr-turns turn-init --dry-run                 # 確認のみ
 ```
 
@@ -105,45 +128,37 @@ herdr-turns \
 | フラグ | 意味 |
 | --- | --- |
 | `--leader` | ハブ役 |
-| `--participant` | 部下プール（1〜3。リーダーは含めない） |
+| `--participant` | 部下プール（1〜7。リーダーは含めない） |
 | `--order` | 訪問順のヒント（実順はリーダーの `NEXT` が優先） |
+| `--steps-per-turn` | 1 ターンのリーダーステップ数（既定 `max(部下数, 4)`、上限 12） |
 
 ### リーダーが画面に出す形式
 
-```text
-NEXT: agent-b
-ROLE: 検証役
-INSTRUCTION: 差分を見て問題を列挙して
-STATUS: CONTINUE
-```
-
-並列ウェーブ例:
+返答の 1 行目には、ランナーが指示するステップ識別行（例: `HUB-DIRECTIVE T1-S2`）を単独で書きます。ランナーは**この行より後ろだけ**を読むので、画面に残った前ステップの返答や、指示文に含まれる書式例を誤って拾いません。識別行がない場合は 1 回だけ書式の再送を求め、それでも無ければ画面全体から読み取ります（`TURN*_HUB.md` に `MARKER_MISSING` と記録）。
 
 ```text
-NEXT: agent-a, agent-b
-ROLE: 調査
-INSTRUCTION: フロントと API を分担して現状を洗い出す
-STATUS: CONTINUE
-```
-
-役割を分けた並列例:
-
-```text
+HUB-DIRECTIVE T1-S2
 NEXT: agent-a
-ROLE: 調査フロント
-INSTRUCTION: UI の問題を列挙
+ROLE: dev.implement
+INSTRUCTION: 設計どおりに API ハンドラを実装する
 NEXT: agent-b
-ROLE: 調査API
-INSTRUCTION: エンドポイントの問題を列挙
+ROLE: qa.review
+INSTRUCTION: 前ステップで実装した認証処理をレビューする
+NEXT: agent-c
+ROLE: research.codebase
+INSTRUCTION: 次に触る画面のコードを洗い出す
 STATUS: CONTINUE
 ```
+
+→ agent-a（書き込み）を実行しながら、agent-b と agent-c（読み取り）が同時に動きます。書き込み役が 2 人以上いれば、書いた順に 1 人ずつ実行されます。
 
 | フィールド | 必須 | 意味 |
 | --- | --- | --- |
-| `NEXT` | 推奨 | report pool 内の名前。カンマ区切りで**並列ウェーブ**（例: `agent-a, agent-b`）。NEXT ブロックを複数書けば役割・指示を分けられる。**省略時のみ** `--order` の default（1 人）。pool 外は **警告のうえ fail** |
-| `ROLE` | 任意 | 短い役割ラベル。ウェーブ共有、または NEXT ブロックごとに個別。pane ラベルが `AI/役割` になる |
-| `INSTRUCTION` | 推奨 | そのステップの作業内容（ウェーブ共有、またはブロックごと） |
-| `STATUS` | 推奨 | `CONTINUE` / `DONE` / `STOP` / `ESCALATE` |
+| `NEXT` | 推奨 | report pool 内の名前。カンマ区切り（例: `agent-a, agent-b`）か NEXT ブロック複数でウェーブ。**省略時のみ** `--order` の default（1 人）。pool 外は 1 回再送、それでも不正なら **fail** |
+| `ROLE` | 推奨 | 組織図のキー（`qa.review` など）または短い役割名。pane ラベルが `AI/役割(部署)` になる |
+| `MODE` | 任意 | `read` / `write`。組織図にない役割で並列にしたいときに `read` を付ける |
+| `INSTRUCTION` | 推奨 | そのステップの作業内容（複数行可） |
+| `STATUS` | 推奨 | `CONTINUE` / `DONE`（目的達成、`COMPLETE.md` を書く）/ `STOP` / `ESCALATE`（`NEEDS_OWNER.md` を書く） |
 
 ### pane→agent bind
 
@@ -165,7 +180,9 @@ STATUS: CONTINUE
 
 ### 直前手渡し（prior handoff）
 
-同じターンのステップ 2 以降、次の部下の assignment に直前部下の名前・ROLE・要約（notes 優先、なければ画面）を付ける。ステップ 1 は `_(なし)_`。
+同じターンのステップ 2 以降、次の部下の assignment に直前ステップの全メンバーの名前・ROLE・MODE・画面末尾の要約を付ける（並列ウェーブでも最後の 1 人だけにならないよう、メンバーごとに均等に切り詰める）。ステップ 1 は `_(なし)_`。
+
+`TURN*_HUB.md` はステップごとに書き出されるため、途中でタイムアウトしてもそこまでの記録が残ります。
 
 成果物は `notes-dir` の `TURN*_HUB.md` / `TURN*_LEADER_STEP*.md` / `TURN*_WORKER_*` など。
 
@@ -191,7 +208,8 @@ herdr-turns auto-yes status    # 状態確認
 
 | 項目 | 内容 |
 | --- | --- |
-| 操作 | 番号付き Yes なら `1`+Enter。`[Y/n]` なら `y`+Enter |
+| 操作 | 番号付き Yes なら `1`+Enter。`[Y/n]` なら `y`+Enter（Esc は送らない） |
+| 自動承認しないもの | `rm -rf`、`git push --force`、`git reset --hard`、`git clean -f`、`DROP TABLE`、`sudo`、`--no-verify`、`terraform apply/destroy`、`kubectl delete` などを含む確認。ログに警告を出し、手動の回答を待つ |
 | 状態ファイル | `~/.config/herdr/auto-yes.json` |
 | ログ | `~/.config/herdr/auto-yes.log` |
 
@@ -237,6 +255,9 @@ herdr-turns --from-here --daemon --turns 5 \
 - `/turn-init` は**分割済みタブでは動かない**（シングルペイン専用）。
 - `/turn-run` 前に各ペインで AI を起動する。bind が pane ラベルと agent 名を揃える（手動 `herdr agent rename` も可）。
 - リーダーの `NEXT` は report pool 内のみ。未知名は fail（default NEXT へ落とさない）。
+- 並列で動く読み取り役は作業フォルダを共有している。編集しない指示は AI への指示であり強制ではないため、編集を伴う作業は必ず開発部（書き込み）の役割で割り当てる。
+- ランナーは作業中・確認待ちのエージェントに Esc を送らない（作業の中断や確認ダイアログの拒否を防ぐ）。
+- 右クリックの「ターン開始...」は従来どおり `boss` という名前のペインにだけ出る。
 - 前景でリーダー自身を待ち続けるとデッドロックしやすい。`/turn-run` と `--from-here` は daemon 前提。
 - upstream への機能 Issue / 実装 PR は出さない（フォーク所有者運用。詳細は `FORK.md` / `AGENTS.md`）。
 

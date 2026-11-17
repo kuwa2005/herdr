@@ -2877,21 +2877,28 @@ class LeaderHubRoutingTests(unittest.TestCase):
             setattr(ns, key, value)
         return ns
 
-    def test_resolve_leader_hub_allows_up_to_three_flexible_reports(self) -> None:
+    def test_resolve_leader_hub_allows_up_to_seven_flexible_reports(self) -> None:
         route = turns.resolve_leader_hub_route(
             self._ns(leader="lead", participants=["alpha", "beta", "gamma"])
         )
         self.assertEqual(route.leader, "lead")
         self.assertEqual(route.workers, ["alpha", "beta", "gamma"])
         self.assertEqual(route.order, ["alpha", "beta", "gamma"])
-        self.assertEqual(turns.MAX_HUB_WORKERS, 3)
+        self.assertEqual(turns.MAX_HUB_WORKERS, 7)
+        seven = [f"w{i}" for i in range(7)]
+        route7 = turns.resolve_leader_hub_route(
+            self._ns(leader="lead", participants=seven)
+        )
+        self.assertEqual(route7.workers, seven)
+        # Legacy planner/coder/reviewer multiparty cap is unchanged.
+        self.assertEqual(turns.MAX_PARTICIPANTS, 4)
 
-    def test_resolve_leader_hub_rejects_four_reports_and_leader_in_pool(self) -> None:
+    def test_resolve_leader_hub_rejects_eight_reports_and_leader_in_pool(self) -> None:
         with self.assertRaises(RuntimeError):
             turns.resolve_leader_hub_route(
                 self._ns(
                     leader="lead",
-                    participants=["a", "b", "c", "d"],
+                    participants=[f"w{i}" for i in range(8)],
                 )
             )
         with self.assertRaises(RuntimeError):
@@ -3346,8 +3353,15 @@ class TurnInitTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             turns.parse_turn_init_names("only-one")
+        self.assertEqual(len(turns.parse_turn_init_names("a,b,c,d,e")), 5)
         with self.assertRaises(ValueError):
-            turns.parse_turn_init_names("a,b,c,d,e")
+            turns.parse_turn_init_names("a,b,c,d,e,f,g,h,i")
+        self.assertEqual(
+            turns.parse_turn_init_names("6"),
+            ["boss", "agent-a", "agent-b", "agent-c", "agent-d", "agent-e"],
+        )
+        with self.assertRaises(ValueError):
+            turns.parse_turn_init_names("9")
         with self.assertRaises(ValueError):
             turns.parse_turn_init_names("a,a")
 
@@ -3761,6 +3775,363 @@ class AutoYesTests(unittest.TestCase):
                 self.assertFalse(turns.is_auto_yes_enabled())
 
 
+
+
+class LeaderHubOrgAndScheduleTests(unittest.TestCase):
+    def test_role_catalog_lookup_and_modes(self) -> None:
+        self.assertEqual(turns.lookup_hub_role("qa.review").mode, "read")
+        self.assertEqual(turns.lookup_hub_role("開発部/実装").key, "dev.implement")
+        self.assertEqual(turns.lookup_hub_role("コードレビュー").key, "qa.review")
+        self.assertEqual(
+            turns.lookup_hub_role("レビュー担当 [qa.review]").key, "qa.review"
+        )
+        self.assertIsNone(turns.lookup_hub_role("謎の役"))
+        departments = {spec.department for spec in turns.HUB_ROLE_CATALOG}
+        self.assertGreaterEqual(len(departments), 7)
+        keys = [spec.key for spec in turns.HUB_ROLE_CATALOG]
+        self.assertEqual(len(keys), len(set(keys)))
+        chart = turns.format_hub_org_chart()
+        self.assertIn("[開発部]", chart)
+        self.assertIn("WRITE/serial", chart)
+        self.assertIn("READ/parallel", chart)
+
+    def test_resolve_assignment_mode_is_conservative(self) -> None:
+        mode = turns.resolve_hub_assignment_mode
+        self.assertEqual(mode("qa.review"), "read")
+        self.assertEqual(mode("dev.implement"), "write")
+        # Catalog write cannot be downgraded by MODE: read.
+        self.assertEqual(mode("dev.implement", "read"), "write")
+        # Catalog read can be upgraded to write.
+        self.assertEqual(mode("qa.review", "write"), "write")
+        self.assertEqual(mode("調査役"), "read")
+        self.assertEqual(mode("実装役"), "write")
+        self.assertEqual(mode("実装済みの確認"), "read")
+        self.assertEqual(mode("謎の役"), "write")
+        self.assertEqual(mode("謎の役", "read"), "read")
+        self.assertEqual(mode(None, None, "Review the diff and report"), "read")
+        self.assertEqual(mode(None), "write")
+
+    def test_parse_directive_uses_last_marker_and_skips_templates(self) -> None:
+        marker = turns.hub_directive_marker(1, 2)
+        screen = (
+            "> Turn 1/3 LEADER HUB (step 2/4).\n"
+            f"Reply format — the first line must be `{marker}` on its own line\n"
+            "  NEXT: <slot name>\n"
+            "  ROLE: <org chart key, or short duty>\n"
+            "  INSTRUCTION: <concrete task; may span lines>\n"
+            "  STATUS: <CONTINUE|DONE|STOP|ESCALATE>\n"
+            "HUB-DIRECTIVE T1-S1\n"
+            "NEXT: c\nROLE: stale\nINSTRUCTION: stale step\nSTATUS: CONTINUE\n"
+            f"⏺ {marker}\n"
+            "  NEXT: a\n"
+            "  ROLE: dev.implement\n"
+            "  INSTRUCTION: implement parser\n"
+            "    with tests\n"
+            "  NEXT: b\n"
+            "  ROLE: qa.review\n"
+            "  MODE: read\n"
+            "  INSTRUCTION: review step 1 diff\n"
+            "  STATUS: CONTINUE\n"
+        )
+        d = turns.parse_leader_directive(
+            screen, known_agents=["a", "b", "c"], default_next="a", marker=marker
+        )
+        self.assertTrue(d.marker_found)
+        self.assertIsNone(d.unknown_next)
+        self.assertEqual([x.worker for x in d.assignments], ["a", "b"])
+        self.assertIn("with tests", d.assignments[0].instruction or "")
+        self.assertEqual(d.assignments[1].requested_mode, "read")
+        self.assertEqual(d.status, "CONTINUE")
+
+    def test_parse_directive_without_marker_ignores_template_lines(self) -> None:
+        screen = (
+            "  NEXT: <slot name>\n"
+            "  INSTRUCTION: <concrete task>\n"
+            "**NEXT:** b\n"
+            "- ROLE: qa.test-run\n"
+            "INSTRUCTION: run tests\n"
+            "STATUS: done\n"
+        )
+        d = turns.parse_leader_directive(
+            screen, known_agents=["a", "b"], default_next="a", marker="HUB-DIRECTIVE T9-S9"
+        )
+        self.assertFalse(d.marker_found)
+        self.assertEqual(d.next_agent, "b")
+        self.assertEqual(d.role, "qa.test-run")
+        self.assertEqual(d.status, "DONE")
+
+    def test_canonicalize_sets_modes_and_plan_splits_wave(self) -> None:
+        wave = turns.canonicalize_hub_assignments(
+            [
+                turns.HubAssignment("a", "dev.implement", "impl"),
+                turns.HubAssignment("b", "qa.review", "review"),
+                turns.HubAssignment("c", "docs.write", "docs"),
+                turns.HubAssignment("d", "research.tech", "research"),
+            ],
+            workers=["a", "b", "c", "d"],
+            goal="g",
+        )
+        self.assertEqual([w.mode for w in wave], ["write", "read", "write", "read"])
+        writers, readers = turns.plan_hub_wave(wave)
+        self.assertEqual([w.worker for w in writers], ["a", "c"])
+        self.assertEqual([r.worker for r in readers], ["b", "d"])
+        self.assertEqual(
+            turns.describe_hub_wave_plan(wave),
+            "serial(write): a → c | parallel(read): b, d",
+        )
+
+    def _run_wave_with_tracking(self, wave, *, fail_on=None):
+        import threading
+        import time as _time
+
+        lock = threading.Lock()
+        active: set[str] = set()
+        events: list[tuple[str, str]] = []
+        max_writers = [0]
+        overlap = [False]
+        modes = {a.worker: a.mode for a in wave}
+
+        def fake_prompt_and_wait(herdr, target, text, *, timeout_ms, env=None, poll_seconds=1.0):
+            del herdr, text, timeout_ms, env, poll_seconds
+            with lock:
+                active.add(target)
+                events.append(("start", target))
+                writers = [w for w in active if modes[w] != "read"]
+                readers = [w for w in active if modes[w] == "read"]
+                max_writers[0] = max(max_writers[0], len(writers))
+                if writers and readers:
+                    overlap[0] = True
+            _time.sleep(0.05)
+            with lock:
+                active.discard(target)
+                events.append(("end", target))
+            if fail_on == target:
+                raise RuntimeError(f"boom {target}")
+
+        with mock.patch.object(
+            turns, "prompt_and_wait", side_effect=fake_prompt_and_wait
+        ), mock.patch.object(
+            turns, "agent_read_text", side_effect=lambda h, t, **k: f"screen-{t}"
+        ):
+            results = turns.run_hub_assignment_wave(
+                herdr="herdr",
+                assignments=wave,
+                build_prompt=lambda a: f"P:{a.worker}",
+                timeout_ms=1000,
+                dry_run=False,
+            )
+        return results, events, max_writers[0], overlap[0]
+
+    def test_wave_serializes_writers_and_parallelizes_readers(self) -> None:
+        wave = [
+            turns.HubAssignment("a", "dev.implement", "i", mode="write"),
+            turns.HubAssignment("b", "qa.review", "r", mode="read"),
+            turns.HubAssignment("c", "dev.test-impl", "t", mode="write"),
+            turns.HubAssignment("d", "sec.audit", "s", mode="read"),
+        ]
+        results, events, max_writers, overlap = self._run_wave_with_tracking(wave)
+        self.assertEqual([a.worker for a, _ in results], ["a", "b", "c", "d"])
+        self.assertEqual(results[2][1], "screen-c")
+        self.assertEqual(max_writers, 1)
+        self.assertTrue(overlap)
+        # Writer order preserved: a finishes before c starts.
+        self.assertLess(events.index(("end", "a")), events.index(("start", "c")))
+
+    def test_wave_unknown_mode_is_serial(self) -> None:
+        wave = [turns.HubAssignment("a", "x", "i"), turns.HubAssignment("b", "y", "j")]
+        _, _, max_writers, _ = self._run_wave_with_tracking(wave)
+        self.assertEqual(max_writers, 1)
+
+    def test_wave_writer_failure_skips_later_writers(self) -> None:
+        wave = [
+            turns.HubAssignment("a", "dev.implement", "i", mode="write"),
+            turns.HubAssignment("c", "dev.bugfix", "f", mode="write"),
+            turns.HubAssignment("b", "qa.review", "r", mode="read"),
+        ]
+        with self.assertRaises(RuntimeError):
+            self._run_wave_with_tracking(wave, fail_on="a")
+
+    def test_wave_summary_caps_each_member(self) -> None:
+        results = [
+            (turns.HubAssignment("a", "dev.implement", "x", mode="write"), "A" * 20_000 + "\nA-END"),
+            (turns.HubAssignment("b", "qa.review", "y", mode="read"), "B-START\n" + "B" * 50 + "\nB-END"),
+        ]
+        summary = turns.format_wave_prior_summary(results, max_chars=4_000)
+        self.assertIn("A-END", summary)
+        self.assertIn("B-END", summary)
+        self.assertIn("MODE `read`", summary)
+        self.assertLess(len(summary), 4_500)
+
+    def test_worker_prompt_mode_contract(self) -> None:
+        common = dict(
+            turn=1, turns=2, step=1, steps=4, worker="b", leader="boss",
+            goal="g", workdir=Path("/repo"), instruction="ROLE: qa.review\nreview",
+        )
+        read = turns.worker_assignment_prompt(role="qa.review", mode="read", **common)
+        self.assertIn("READ-ONLY", read)
+        self.assertIn("品質保証部", read)
+        write = turns.worker_assignment_prompt(role="dev.implement", mode="write", **common)
+        self.assertIn("only report allowed to edit", write)
+
+    def test_leader_briefing_has_org_chart_marker_and_rules(self) -> None:
+        route = turns.LeaderHubRoute(leader="boss", workers=["a", "b"], order=["a", "b"])
+        prompt = turns.leader_briefing_prompt(
+            turn=2, turns=3, step=3, steps=4, route=route, goal="g",
+            workdir=Path("/repo"), notes_dir=Path("/notes"), default_next="a",
+            last_agent=None, last_output="",
+        )
+        self.assertIn("`HUB-DIRECTIVE T2-S3`", prompt)
+        self.assertIn("dev.implement", prompt)
+        self.assertIn("ONE AT A TIME", prompt)
+        self.assertIn("PARALLEL", prompt)
+        # The echoed prompt itself must not parse as a directive.
+        d = turns.parse_leader_directive(
+            prompt, known_agents=["a", "b"], default_next=None,
+            marker=turns.hub_directive_marker(2, 3),
+        )
+        self.assertFalse(d.marker_found)
+        self.assertIsNone(d.unknown_next)
+        self.assertEqual(d.assignments, [])
+
+    def test_steps_per_turn_resolution(self) -> None:
+        self.assertEqual(turns.resolve_hub_steps_per_turn(None, 3), 4)
+        self.assertEqual(turns.resolve_hub_steps_per_turn(None, 6), 6)
+        self.assertEqual(turns.resolve_hub_steps_per_turn(2, 6), 2)
+        with self.assertRaises(RuntimeError):
+            turns.resolve_hub_steps_per_turn(13, 3)
+        with self.assertRaises(RuntimeError):
+            turns.resolve_hub_steps_per_turn(0, 3)
+
+    def test_split_tab_for_turn_init_grids(self) -> None:
+        for count, expected_splits in [(2, 1), (3, 2), (4, 3), (6, 5), (8, 7)]:
+            calls: list[tuple[str, str, float | None]] = []
+            counter = [0]
+
+            def fake_split(herdr, pane_id, direction, *, env=None, ratio=None):
+                del herdr, env
+                counter[0] += 1
+                calls.append((pane_id, direction, ratio))
+                return f"p{counter[0]}"
+
+            with mock.patch.object(turns, "split_pane", side_effect=fake_split):
+                turns.split_tab_for_turn_init("herdr", "root", count)
+            self.assertEqual(len(calls), expected_splits, count)
+            cols = turns.turn_init_grid_columns(count)
+            rights = [c for c in calls if c[1] == "right"]
+            self.assertEqual(len(rights), cols - 1)
+            if cols == 4:
+                self.assertAlmostEqual(rights[0][2], 0.25)
+                self.assertAlmostEqual(rights[1][2], 1 / 3)
+                self.assertIsNone(rights[2][2])
+        with self.assertRaises(ValueError):
+            turns.split_tab_for_turn_init("herdr", "root", 9)
+
+    def test_run_leader_hub_turns_end_to_end_mock(self) -> None:
+        leader_replies = [
+            (
+                "HUB-DIRECTIVE T1-S1\n"
+                "NEXT: a\nROLE: dev.implement\nINSTRUCTION: implement X\n"
+                "NEXT: b\nROLE: qa.review\nINSTRUCTION: review previous work\n"
+                "STATUS: CONTINUE\n"
+            ),
+            "HUB-DIRECTIVE T1-S2\nSTATUS: DONE\nINSTRUCTION: goal met\n",
+        ]
+        prompts: list[tuple[str, str]] = []
+
+        def fake_prompt(herdr, target, text, *, timeout_ms, env=None, poll_seconds=1.0):
+            prompts.append((target, text))
+
+        def fake_read(herdr, target, **kwargs):
+            if target == "boss":
+                return leader_replies.pop(0)
+            return f"{target} finished"
+
+        args = argparse.Namespace(
+            herdr="herdr", dry_run=False, goal="ship X", timeout_ms=1000,
+            steps_per_turn=None, acceptance=None,
+        )
+        route = turns.LeaderHubRoute(leader="boss", workers=["a", "b"], order=["a", "b"])
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            turns, "prompt_and_wait", side_effect=fake_prompt
+        ), mock.patch.object(
+            turns, "agent_read_text", side_effect=fake_read
+        ), mock.patch.object(
+            turns, "map_hub_slots_to_panes", side_effect=RuntimeError("no panes")
+        ):
+            notes = Path(tmp)
+            code = turns.run_leader_hub_turns(
+                args, workdir=Path(tmp), notes_dir=notes, start_turn=1,
+                end_turn=2, route=route,
+            )
+            self.assertEqual(code, 0)
+            complete = (notes / "COMPLETE.md").read_text(encoding="utf-8")
+            self.assertIn("status: DONE", complete)
+            hub_log = (notes / "TURN1_HUB.md").read_text(encoding="utf-8")
+            self.assertIn("serial(write): a | parallel(read): b", hub_log)
+            self.assertIn("Stopped: leader STATUS: DONE", hub_log)
+            self.assertFalse((notes / "TURN2_HUB.md").exists())
+        worker_prompts = {t: p for t, p in prompts if t != "boss"}
+        self.assertIn("MODE: write", worker_prompts["a"])
+        self.assertIn("READ-ONLY", worker_prompts["b"])
+        second_leader = [p for t, p in prompts if t == "boss"][1]
+        self.assertIn("a finished", second_leader)
+        self.assertIn("b finished", second_leader)
+
+    def test_run_leader_hub_turns_writes_log_on_timeout(self) -> None:
+        def fake_prompt(herdr, target, text, *, timeout_ms, env=None, poll_seconds=1.0):
+            if target == "a":
+                raise TimeoutError("slow")
+
+        def fake_read(herdr, target, **kwargs):
+            return "HUB-DIRECTIVE T1-S1\nNEXT: a\nROLE: dev.implement\nINSTRUCTION: x\n"
+
+        args = argparse.Namespace(
+            herdr="herdr", dry_run=False, goal="g", timeout_ms=1000,
+            steps_per_turn=1, acceptance=None,
+        )
+        route = turns.LeaderHubRoute(leader="boss", workers=["a"], order=["a"])
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            turns, "prompt_and_wait", side_effect=fake_prompt
+        ), mock.patch.object(
+            turns, "agent_read_text", side_effect=fake_read
+        ), mock.patch.object(
+            turns, "map_hub_slots_to_panes", side_effect=RuntimeError("no panes")
+        ):
+            notes = Path(tmp)
+            with self.assertRaises(TimeoutError):
+                turns.run_leader_hub_turns(
+                    args, workdir=Path(tmp), notes_dir=notes, start_turn=1,
+                    end_turn=1, route=route,
+                )
+            log = (notes / "TURN1_HUB.md").read_text(encoding="utf-8")
+            self.assertIn("## Step 1", log)
+
+
+class AgentSafetyTests(unittest.TestCase):
+    def test_prepare_agent_skips_esc_while_working_or_blocked(self) -> None:
+        for status, expect_esc in [("working", False), ("blocked", False), ("idle", True)]:
+            with mock.patch.object(turns, "agent_focus"), mock.patch.object(
+                turns, "agent_status", return_value=status
+            ), mock.patch.object(turns, "agent_send_keys") as keys, mock.patch.object(
+                turns.time, "sleep"
+            ):
+                turns.prepare_agent("herdr", "a")
+            self.assertEqual(keys.called, expect_esc, status)
+
+    def test_auto_yes_refuses_dangerous_and_sends_no_esc(self) -> None:
+        danger = "Do you want to proceed?\n  rm -rf build/\n❯ 1. Yes\n  2. No\n"
+        safe = "Do you want to proceed?\n  cargo test\n❯ 1. Yes\n  2. No\n"
+        self.assertTrue(turns.auto_yes_dangerous_match(danger))
+        self.assertTrue(turns.auto_yes_dangerous_match("git push origin main --force"))
+        self.assertIsNone(turns.auto_yes_dangerous_match(safe))
+        with mock.patch.object(turns, "agent_read_text", return_value=danger), \
+                mock.patch.object(turns, "agent_send_keys") as keys:
+            self.assertFalse(turns.try_auto_yes_for_target("herdr", "a", force=True))
+            keys.assert_not_called()
+        with mock.patch.object(turns, "agent_read_text", return_value=safe), \
+                mock.patch.object(turns, "agent_send_keys") as keys:
+            self.assertTrue(turns.try_auto_yes_for_target("herdr", "a", force=True))
+            keys.assert_called_once_with("herdr", "a", "1", "enter", env=None)
 
 
 if __name__ == "__main__":

@@ -30,16 +30,19 @@ Use ``--self`` to keep the old single-pane self-review mode. Explicit
 
 Manual multi-party (2–4 already-running named agents, no nest/split):
 
-* **Leader hub** (preferred): ``--leader NAME`` plus up to 3
+* **Leader hub** (preferred): ``--leader NAME`` plus up to 7
   ``--participant`` reports (subordinates). Roles are **not fixed** —
-  the leader assigns duties per goal via ``NEXT`` / ``INSTRUCTION`` /
-  ``STATUS``. Each step reads a report's TUI, briefs the leader, then
-  prompts the chosen report(s). A comma ``NEXT`` wave runs workers in
-  parallel, then merges results before the next leader step. See
-  ``resolve_leader_hub_route`` / ``run_leader_hub_turns``.
+  the leader assigns a duty from a company org chart
+  (``HUB_ROLE_CATALOG``) per step via ``NEXT`` / ``ROLE`` / ``MODE`` /
+  ``INSTRUCTION`` / ``STATUS``, after a per-step ``HUB-DIRECTIVE Tn-Sm``
+  marker line. Within a wave, ``write`` duties (edit the workdir) run one
+  at a time; ``read`` duties run in parallel with them. See
+  ``resolve_leader_hub_route`` / ``run_hub_assignment_wave`` /
+  ``run_leader_hub_turns``.
 * **Init names**: ``herdr-turns /turn-init`` (defaults to
-  ``boss,agent-a,agent-b,agent-c``) only on a **single-pane** tab; it
-  splits to a grid then renames panes in visual order.
+  ``boss,agent-a,agent-b,agent-c``; ``turn-init 6`` for a 6-pane grid, up
+  to 8) only on a **single-pane** tab; it splits to a two-row grid then
+  renames panes in visual order.
 * **Run hub**: from the leader pane, ``herdr-turns /turn-run 3,"goal"``
   (or ``turn-run 3,"goal"``) starts the leader-hub loop (daemon) using
   the current pane as ``--leader`` and other tab targets as
@@ -66,6 +69,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -81,11 +85,21 @@ DEFAULT_TURNS = 10
 # Manual multi-party conversation (already-running named agents; no nest/split).
 MIN_PARTICIPANTS = 2
 MAX_PARTICIPANTS = 4
-# Leader hub: 1 leader + 1..3 workers (total still capped at MAX_PARTICIPANTS).
+# Leader hub: 1 leader + 1..7 workers (independent of the legacy
+# planner/coder/reviewer multiparty cap above).
 MIN_HUB_WORKERS = 1
-MAX_HUB_WORKERS = MAX_PARTICIPANTS - 1
+MAX_HUB_WORKERS = 7
+# turn-init grid: leader + reports (2..8 panes).
+MAX_TURN_INIT_PANES = MAX_HUB_WORKERS + 1
 HUB_READ_LINES = 80
 HUB_READ_MAX_CHARS = 6_000
+# Leader steps per turn. Default: max(report count, this floor) so a turn is
+# not silently capped at "one visit per report".
+HUB_MIN_STEPS_PER_TURN = 4
+HUB_MAX_STEPS_PER_TURN = 12
+# Total worker evidence forwarded to the leader per step (all wave members).
+HUB_LEADER_EVIDENCE_MAX_CHARS = 9_000
+HUB_LEADER_EVIDENCE_MIN_PER_WORKER = 1_200
 # Default names when ``turn-init`` / ``/turn-init`` is invoked with no args.
 DEFAULT_TURN_INIT_NAMES = ["boss", "agent-a", "agent-b", "agent-c"]
 AUTO_YES_STATE_FILENAME = "auto-yes.json"
@@ -189,6 +203,11 @@ class HubAssignment:
     worker: str
     role: str | None = None
     instruction: str | None = None
+    # "read" (parallel-safe, no workdir edits) or "write" (serialized).
+    # ``None`` until canonicalize_hub_assignments resolves it.
+    mode: str | None = None
+    # Explicit ``MODE:`` from the leader (before catalog/heuristic merge).
+    requested_mode: str | None = None
 
 
 @dataclass
@@ -208,6 +227,9 @@ class LeaderDirective:
     # Callers must NOT fall back to default_next when this is set.
     unknown_next: str | None = None
     assignments: list[HubAssignment] = field(default_factory=list)
+    # False when a reply marker was requested but not found on screen (the
+    # parse then fell back to the whole snapshot and may be stale).
+    marker_found: bool = True
 
     def __post_init__(self) -> None:
         if self.assignments or self.unknown_next or not self.next_agent:
@@ -325,6 +347,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Without --leader: among all --participant names. "
             "Every listed name in the active set must appear at least once; "
             "unknown names are rejected"
+        ),
+    )
+    p.add_argument(
+        "--steps-per-turn",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "With --leader: leader steps per turn (default: max(report count, "
+            f"{HUB_MIN_STEPS_PER_TURN}); hard cap {HUB_MAX_STEPS_PER_TURN})"
         ),
     )
     p.add_argument(
@@ -735,14 +767,307 @@ def multiparty_handoff_prompt(
     )
 
 
-LEADER_NEXT_RE = re.compile(r"(?im)^\s*NEXT\s*:\s*(.+?)\s*$")
-LEADER_STATUS_RE = re.compile(
-    r"(?im)^\s*STATUS\s*:\s*(CONTINUE|DONE|STOP|ESCALATE)\s*$"
+# TUI decoration that may precede a field line on screen (bullets, box
+# drawing, Claude Code's reply dot, markdown list markers).
+_HUB_LINE_PREFIX = r"^[ \t>│┃|⏺●•·*\-]*"
+_HUB_LINE_SUFFIX = r"[ \t│┃]*$"
+
+
+def _hub_field_re(name: str, value: str = r"(.+?)") -> re.Pattern[str]:
+    # Optional markdown bold around the field name (``**NEXT:**``) and
+    # full-width colon are tolerated.
+    return re.compile(
+        rf"(?im){_HUB_LINE_PREFIX}\**{name}\**[ \t]*[:：][ \t]*\**[ \t]*"
+        rf"{value}\**{_HUB_LINE_SUFFIX}"
+    )
+
+
+LEADER_NEXT_RE = _hub_field_re("NEXT")
+LEADER_STATUS_RE = _hub_field_re("STATUS", r"(CONTINUE|DONE|STOP|ESCALATE)")
+LEADER_INSTRUCTION_LINE_RE = re.compile(
+    rf"(?im){_HUB_LINE_PREFIX}\**INSTRUCTION\**[ \t]*[:：][ \t]*\**[ \t]*(.*)$"
 )
-LEADER_INSTRUCTION_LINE_RE = re.compile(r"(?im)^\s*INSTRUCTION\s*:\s*(.*)$")
-LEADER_ROLE_RE = re.compile(r"(?im)^\s*ROLE\s*:\s*(.+?)\s*$")
+LEADER_ROLE_RE = _hub_field_re("ROLE")
+LEADER_MODE_RE = _hub_field_re("MODE")
+_HUB_FIELD_STOP_RE = re.compile(
+    rf"(?i){_HUB_LINE_PREFIX}\**"
+    r"(NEXT|STATUS|INSTRUCTION|ROLE|MODE|VERDICT|TASK|DONE_WHEN)\**[ \t]*[:：]"
+)
 HUB_ROLE_MAX_CHARS = 80
 HUB_PRIOR_HANDOFF_MAX_CHARS = 1_200
+HUB_DIRECTIVE_MARKER_PREFIX = "HUB-DIRECTIVE"
+
+HUB_MODE_READ = "read"
+HUB_MODE_WRITE = "write"
+_HUB_MODE_ALIASES = {
+    "read": HUB_MODE_READ,
+    "readonly": HUB_MODE_READ,
+    "read-only": HUB_MODE_READ,
+    "ro": HUB_MODE_READ,
+    "parallel": HUB_MODE_READ,
+    "読み取り": HUB_MODE_READ,
+    "読取": HUB_MODE_READ,
+    "参照": HUB_MODE_READ,
+    "並列": HUB_MODE_READ,
+    "並列可": HUB_MODE_READ,
+    "write": HUB_MODE_WRITE,
+    "rw": HUB_MODE_WRITE,
+    "edit": HUB_MODE_WRITE,
+    "serial": HUB_MODE_WRITE,
+    "書き込み": HUB_MODE_WRITE,
+    "書込": HUB_MODE_WRITE,
+    "編集": HUB_MODE_WRITE,
+    "直列": HUB_MODE_WRITE,
+}
+
+
+@dataclass(frozen=True)
+class HubRoleSpec:
+    """One duty in the hub's company org chart.
+
+    ``mode`` decides scheduling: ``write`` duties edit the shared workdir and
+    are serialized (one writer at a time); ``read`` duties must not edit the
+    workdir and may run in parallel with each other and with the writer.
+    """
+
+    key: str
+    department: str
+    title: str
+    mode: str
+    duty: str
+    aliases: tuple[str, ...] = ()
+
+
+# Company-style org chart. Reports (agent-a, …) are not bound to a role;
+# the leader picks one of these per assignment via ``ROLE:``.
+HUB_ROLE_CATALOG: tuple[HubRoleSpec, ...] = (
+    # 経営企画部
+    HubRoleSpec("plan.requirements", "経営企画部", "要件定義", HUB_MODE_READ,
+                "目的と受け入れ条件を具体化し、曖昧点を列挙する",
+                ("requirements", "要件", "企画")),
+    HubRoleSpec("plan.breakdown", "経営企画部", "タスク分解", HUB_MODE_READ,
+                "作業を独立した小タスクに分け、依存関係と順序を示す",
+                ("planner", "plan", "計画", "タスク分解")),
+    # 調査部
+    HubRoleSpec("research.codebase", "調査部", "コード調査", HUB_MODE_READ,
+                "関係するファイル・関数・既存パターンを洗い出す",
+                ("codebase", "investigate", "コード調査", "調査")),
+    HubRoleSpec("research.root-cause", "調査部", "原因調査", HUB_MODE_READ,
+                "不具合の再現手順と根本原因を特定する（修正はしない）",
+                ("root-cause", "debug", "原因調査", "原因分析")),
+    HubRoleSpec("research.tech", "調査部", "技術調査", HUB_MODE_READ,
+                "ライブラリ・API・代替案を比較し推奨を出す",
+                ("research", "技術調査")),
+    # 設計部
+    HubRoleSpec("design.architecture", "設計部", "アーキテクト", HUB_MODE_READ,
+                "変更方針・モジュール境界・影響範囲を設計する（編集しない）",
+                ("architect", "architecture", "設計", "アーキテクチャ")),
+    HubRoleSpec("design.interface", "設計部", "IF設計", HUB_MODE_READ,
+                "API・データ形式・互換性を設計する",
+                ("api-design", "interface", "インタフェース設計")),
+    HubRoleSpec("design.ux", "設計部", "UI/UX設計", HUB_MODE_READ,
+                "画面・操作の流れを既存UIに沿って設計する",
+                ("ux", "ui", "ui設計", "ux設計")),
+    # 開発部（書き込み＝直列）
+    HubRoleSpec("dev.implement", "開発部", "実装", HUB_MODE_WRITE,
+                "設計・指示に従ってコードを変更する",
+                ("implement", "implementer", "coder", "developer", "実装", "実装担当")),
+    HubRoleSpec("dev.bugfix", "開発部", "バグ修正", HUB_MODE_WRITE,
+                "特定済みの原因に対して最小の修正を入れる",
+                ("bugfix", "fix", "fixer", "修正", "バグ修正")),
+    HubRoleSpec("dev.refactor", "開発部", "リファクタ", HUB_MODE_WRITE,
+                "挙動を変えずに構造を整理する",
+                ("refactor", "リファクタリング")),
+    HubRoleSpec("dev.test-impl", "開発部", "テスト実装", HUB_MODE_WRITE,
+                "不足しているテストコードを追加・修正する",
+                ("test-impl", "test-writer", "テスト作成", "テスト追加")),
+    # 品質保証部（読み取り＝並列可）
+    HubRoleSpec("qa.review", "品質保証部", "コードレビュー", HUB_MODE_READ,
+                "実装済みの差分を読み、不具合・漏れ・規約違反を指摘する",
+                ("review", "reviewer", "code-review", "レビュー", "レビュアー")),
+    HubRoleSpec("qa.test-run", "品質保証部", "テスト実行", HUB_MODE_READ,
+                "既存テスト・ビルドを実行し結果を報告する（ソースは編集しない）",
+                ("test", "tester", "verify", "verification", "検証", "テスト", "テスト実行")),
+    HubRoleSpec("qa.acceptance", "品質保証部", "受け入れ確認", HUB_MODE_READ,
+                "受け入れ条件を満たすかを実装済みの状態で確認する",
+                ("acceptance", "受け入れ", "受入確認", "完了確認")),
+    # セキュリティ室
+    HubRoleSpec("sec.audit", "セキュリティ室", "セキュリティ監査", HUB_MODE_READ,
+                "認証情報の混入・入力検証・権限などの観点で差分を監査する",
+                ("security", "audit", "セキュリティ", "監査")),
+    # 運用・インフラ部
+    HubRoleSpec("ops.build", "運用・インフラ部", "ビルド/CI確認", HUB_MODE_READ,
+                "ビルド・lint・CI相当のチェックを実行し失敗を報告する",
+                ("build", "ci", "lint", "ビルド確認")),
+    HubRoleSpec("ops.perf", "運用・インフラ部", "性能計測", HUB_MODE_READ,
+                "性能・リソースへの影響を計測・評価する",
+                ("perf", "performance", "benchmark", "性能")),
+    # 広報・ドキュメント部
+    HubRoleSpec("docs.write", "ドキュメント部", "ドキュメント作成", HUB_MODE_WRITE,
+                "README・利用手順・変更点の文書を更新する",
+                ("docs", "documentation", "writer", "ドキュメント", "文書作成")),
+    HubRoleSpec("docs.review", "ドキュメント部", "文書校閲", HUB_MODE_READ,
+                "文書の正確さ・分かりやすさを確認する（編集しない）",
+                ("doc-review", "proofread", "校閲")),
+)
+
+# Fallback keyword heuristics when ROLE is free text (catalog miss).
+# Write wins over read: an ambiguous duty is serialized (safe default).
+_HUB_WRITE_HINT_RE = re.compile(
+    r"(?i)(implement|refactor|\bfix|\bedit|\bwrite\b|\bcode\b|coder|migrat|"
+    r"実装|修正|改修|編集|変更|追加|削除|書き換|リファクタ|作成)"
+)
+_HUB_READ_HINT_RE = re.compile(
+    r"(?i)(review|verif|test|audit|research|investigat|analy|inspect|plan|"
+    r"design|measure|check|レビュー|確認|検証|調査|分析|監査|計画|設計|計測|"
+    r"テスト実行|点検)"
+)
+# Read-only phrasing that should not be overridden by a write noun inside it
+# (e.g. 「実装済みの確認」「実装レビュー」).
+_HUB_READ_OVERRIDE_RE = re.compile(
+    r"(?i)(実装済み|実装の?確認|実装の?レビュー|実装の?検証|"
+    r"review (?:the )?implementation|verify (?:the )?implementation)"
+)
+
+
+def _hub_role_lookup_key(text: str) -> str:
+    return re.sub(r"[\s_]+", "", (text or "").casefold())
+
+
+def _build_hub_role_index() -> dict[str, HubRoleSpec]:
+    index: dict[str, HubRoleSpec] = {}
+    for spec in HUB_ROLE_CATALOG:
+        candidates = [
+            spec.key,
+            spec.title,
+            f"{spec.department}/{spec.title}",
+            f"{spec.department}·{spec.title}",
+            *spec.aliases,
+        ]
+        for cand in candidates:
+            index.setdefault(_hub_role_lookup_key(cand), spec)
+    return index
+
+
+_HUB_ROLE_INDEX = _build_hub_role_index()
+
+
+def lookup_hub_role(role: str | None) -> HubRoleSpec | None:
+    """Resolve a leader ``ROLE:`` label to a catalog entry (or None).
+
+    Accepts the catalog key (``qa.review``), title (``コードレビュー``),
+    ``部署/役割`` and aliases. A trailing ``[key]`` or ``(key)`` hint wins.
+    """
+    raw = normalize_hub_role(role)
+    if not raw:
+        return None
+    hint = re.search(r"[\[(（]\s*([a-z]+\.[a-z-]+)\s*[\])）]", raw)
+    if hint:
+        spec = _HUB_ROLE_INDEX.get(_hub_role_lookup_key(hint.group(1)))
+        if spec is not None:
+            return spec
+    spec = _HUB_ROLE_INDEX.get(_hub_role_lookup_key(raw))
+    if spec is not None:
+        return spec
+    # ``部署/役割 — 補足`` style: try the head before separators.
+    head = re.split(r"\s+[-—:：]\s+|[（(\[]", raw, maxsplit=1)[0].strip()
+    if head and head != raw:
+        return _HUB_ROLE_INDEX.get(_hub_role_lookup_key(head))
+    return None
+
+
+def normalize_hub_mode(raw: str | None) -> str | None:
+    """Normalize a leader ``MODE:`` value to read/write (None if unknown)."""
+    if raw is None:
+        return None
+    text = str(raw).strip().strip("`*").strip()
+    if not text:
+        return None
+    head = re.split(r"[\s,/(（]", text, maxsplit=1)[0]
+    return _HUB_MODE_ALIASES.get(head.casefold()) or _HUB_MODE_ALIASES.get(
+        text.casefold()
+    )
+
+
+def resolve_hub_assignment_mode(
+    role: str | None,
+    requested_mode: str | None = None,
+    instruction: str | None = None,
+) -> str:
+    """Decide whether an assignment may run in parallel.
+
+    Order of evidence (any ``write`` wins, so edits are never parallelized by
+    accident):
+
+    1. Catalog role mode (``dev.*`` / ``docs.write`` are write).
+    2. Explicit ``MODE:`` from the leader.
+    3. Keyword heuristics on ROLE (then INSTRUCTION) when the role is unknown.
+    4. Nothing conclusive → ``write`` (serialized, safe default).
+    """
+    spec = lookup_hub_role(role)
+    requested = normalize_hub_mode(requested_mode)
+    if spec is not None:
+        if HUB_MODE_WRITE in (spec.mode, requested):
+            return HUB_MODE_WRITE
+        return HUB_MODE_READ
+    if requested is not None:
+        return requested
+    for text in (normalize_hub_role(role) or "", instruction or ""):
+        if not text:
+            continue
+        if _HUB_READ_OVERRIDE_RE.search(text) and not re.search(
+            r"(?i)(修正して|直して|fix it|apply)", text
+        ):
+            return HUB_MODE_READ
+        if _HUB_WRITE_HINT_RE.search(text):
+            return HUB_MODE_WRITE
+        if _HUB_READ_HINT_RE.search(text):
+            return HUB_MODE_READ
+    return HUB_MODE_WRITE
+
+
+def hub_role_display(role: str | None) -> str | None:
+    """Short pane-label text for a role: catalog ``役割(部署)`` or raw label."""
+    spec = lookup_hub_role(role)
+    if spec is not None:
+        return f"{spec.title}({spec.department})"
+    return normalize_hub_role(role)
+
+
+def format_hub_org_chart() -> str:
+    """Render the role catalog for the leader briefing, grouped by department."""
+    lines: list[str] = []
+    current: str | None = None
+    for spec in HUB_ROLE_CATALOG:
+        if spec.department != current:
+            current = spec.department
+            lines.append(f"[{current}]")
+        tag = "WRITE/serial" if spec.mode == HUB_MODE_WRITE else "READ/parallel"
+        lines.append(f"  - {spec.key} {spec.title} ({tag}): {spec.duty}")
+    return "\n".join(lines)
+
+
+def hub_directive_marker(turn: int, step: int) -> str:
+    """Per-step reply marker so stale replies / echoed prompts are skipped."""
+    return f"{HUB_DIRECTIVE_MARKER_PREFIX} T{turn}-S{step}"
+
+
+def slice_after_reply_marker(text: str, marker: str) -> str | None:
+    """Return text after the LAST standalone *marker* line, or None.
+
+    The leader prints the marker on its own line at the top of its reply. The
+    echoed prompt only mentions it inline (inside backticks with trailing
+    text), so it does not match a standalone line.
+    """
+    pattern = re.compile(
+        rf"(?m){_HUB_LINE_PREFIX}`?{re.escape(marker)}`?{_HUB_LINE_SUFFIX}"
+    )
+    last = None
+    for match in pattern.finditer(text or ""):
+        last = match
+    if last is None:
+        return None
+    return (text or "")[last.end() :]
 
 
 def wants_leader_hub(args: argparse.Namespace) -> bool:
@@ -785,7 +1110,7 @@ def resolve_leader_hub_route(args: argparse.Namespace) -> LeaderHubRoute:
     if n > MAX_HUB_WORKERS:
         raise RuntimeError(
             f"--leader accepts at most {MAX_HUB_WORKERS} --participant "
-            f"workers (got {n}; total cap {MAX_PARTICIPANTS})"
+            f"workers (got {n})"
         )
     try:
         parsed_order = parse_order_names(getattr(args, "order", None))
@@ -847,31 +1172,48 @@ def prepend_role_to_instruction(instruction: str, role: str | None) -> str:
 
 def split_hub_next_names(raw: str) -> list[str]:
     """Split a NEXT value into one or more report names (comma-separated)."""
-    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
+    text = str(raw or "").replace("、", ",").replace("，", ",")
+    return [part.strip().strip("`*").strip() for part in text.split(",") if part.strip()]
+
+
+def _is_template_value(value: str | None) -> bool:
+    """True for placeholder text echoed from the prompt (``<one slot…>``)."""
+    text = (value or "").strip()
+    return bool(text) and ("<" in text and ">" in text)
 
 
 def _extract_instruction_from_block(block: str) -> str | None:
     """Pull INSTRUCTION (multi-line) from a NEXT block body."""
-    instr_m = LEADER_INSTRUCTION_LINE_RE.search(block)
-    if not instr_m:
-        return None
-    first = instr_m.group(1).strip()
-    rest_lines: list[str] = []
-    if first:
-        rest_lines.append(first)
-    for line in block[instr_m.end() :].splitlines():
-        if re.match(
-            r"(?i)^\s*(NEXT|STATUS|INSTRUCTION|ROLE|VERDICT|TASK|DONE_WHEN)\s*:",
-            line,
-        ):
-            break
-        rest_lines.append(line.rstrip())
-    return "\n".join(rest_lines).strip() or None
+    for instr_m in LEADER_INSTRUCTION_LINE_RE.finditer(block):
+        first = instr_m.group(1).strip().rstrip("│┃").strip()
+        if _is_template_value(first):
+            continue
+        rest_lines: list[str] = []
+        if first:
+            rest_lines.append(first)
+        for line in block[instr_m.end() :].splitlines():
+            if _HUB_FIELD_STOP_RE.match(line):
+                break
+            rest_lines.append(line.rstrip().rstrip("│┃").rstrip())
+        return "\n".join(rest_lines).strip() or None
+    return None
+
+
+def _extract_last_field(pattern: re.Pattern[str], block: str) -> str | None:
+    value: str | None = None
+    for match in pattern.finditer(block):
+        candidate = match.group(1).strip()
+        if candidate and not _is_template_value(candidate):
+            value = candidate
+    return value
 
 
 def _extract_role_from_block(block: str) -> str | None:
-    role_m = LEADER_ROLE_RE.search(block)
-    return normalize_hub_role(role_m.group(1) if role_m else None)
+    return normalize_hub_role(_extract_last_field(LEADER_ROLE_RE, block))
+
+
+def _extract_mode_from_block(block: str) -> str | None:
+    return normalize_hub_mode(_extract_last_field(LEADER_MODE_RE, block))
 
 
 def parse_leader_directive(
@@ -879,23 +1221,42 @@ def parse_leader_directive(
     *,
     known_agents: list[str],
     default_next: str | None = None,
+    marker: str | None = None,
 ) -> LeaderDirective:
-    """Extract NEXT / ROLE / INSTRUCTION / STATUS from a leader pane snapshot.
+    """Extract NEXT / ROLE / MODE / INSTRUCTION / STATUS from a leader snapshot.
 
     ``NEXT`` may list one name, a comma wave (``a, b``), or appear multiple
-    times with per-block ROLE/INSTRUCTION. A wave of 2+ workers runs in
-    parallel and merges before the next leader step.
+    times with per-block ROLE/MODE/INSTRUCTION. Wave members with ``read``
+    duties run in parallel; ``write`` duties are serialized (see
+    ``run_hub_assignment_wave``).
 
+    When *marker* is given, only text after the last standalone marker line
+    is parsed (skips the echoed prompt and earlier steps' replies). Missing
+    marker → whole text is parsed and ``marker_found`` is False.
+
+    Placeholder lines echoed from the prompt (``NEXT: <…>``) are ignored.
     ``NEXT`` omitted → fall back to ``default_next`` when provided.
     Any name outside ``known_agents`` → ``unknown_next`` set; no default
     fallback for that step.
     """
-    body = text or ""
-    status_m = LEADER_STATUS_RE.search(body)
-    status = status_m.group(1).upper() if status_m else "CONTINUE"
+    raw = text or ""
+    marker_found = True
+    body = raw
+    if marker:
+        sliced = slice_after_reply_marker(raw, marker)
+        if sliced is None:
+            marker_found = False
+        else:
+            body = sliced
+    status_value = _extract_last_field(LEADER_STATUS_RE, body)
+    status = status_value.upper() if status_value else "CONTINUE"
     by_key = {a.casefold(): a for a in known_agents}
 
-    next_matches = list(LEADER_NEXT_RE.finditer(body))
+    next_matches = [
+        m
+        for m in LEADER_NEXT_RE.finditer(body)
+        if not _is_template_value(m.group(1))
+    ]
     assignments: list[HubAssignment] = []
     unknowns: list[str] = []
 
@@ -908,12 +1269,16 @@ def parse_leader_directive(
 
     if not next_matches:
         role = _extract_role_from_block(body)
+        mode = _extract_mode_from_block(body)
         instruction = _extract_instruction_from_block(body)
         next_agent = default_next
         if next_agent is not None:
             assignments = [
                 HubAssignment(
-                    worker=next_agent, role=role, instruction=instruction
+                    worker=next_agent,
+                    role=role,
+                    instruction=instruction,
+                    requested_mode=mode,
                 )
             ]
         return LeaderDirective(
@@ -923,6 +1288,7 @@ def parse_leader_directive(
             role=role,
             unknown_next=None,
             assignments=assignments,
+            marker_found=marker_found,
         )
 
     for index, match in enumerate(next_matches):
@@ -932,21 +1298,25 @@ def parse_leader_directive(
             else len(body)
         )
         block = body[match.end() : block_end]
-        status_cut = re.search(r"(?im)^\s*STATUS\s*:", block)
+        status_cut = re.search(rf"(?im){_HUB_LINE_PREFIX}\**STATUS\**[ \t]*[:：]", block)
         if status_cut:
             block = block[: status_cut.start()]
         role = _extract_role_from_block(block)
+        mode = _extract_mode_from_block(block)
         instruction = _extract_instruction_from_block(block)
         # Single NEXT line may use fields that appeared before it.
         if len(next_matches) == 1:
+            before = body[: match.start()] + "\n" + block
             if role is None:
-                role = _extract_role_from_block(body[: match.start()] + "\n" + block)
+                role = _extract_role_from_block(before)
+            if mode is None:
+                mode = _extract_mode_from_block(before)
             if instruction is None:
-                instruction = _extract_instruction_from_block(
-                    body[: match.start()] + "\n" + block
-                )
+                instruction = _extract_instruction_from_block(before)
             if role is None:
                 role = _extract_role_from_block(body)
+            if mode is None:
+                mode = _extract_mode_from_block(body)
             if instruction is None:
                 instruction = _extract_instruction_from_block(body)
         names = split_hub_next_names(match.group(1))
@@ -961,7 +1331,12 @@ def parse_leader_directive(
             if any(a.worker.casefold() == canon.casefold() for a in assignments):
                 continue
             assignments.append(
-                HubAssignment(worker=canon, role=role, instruction=instruction)
+                HubAssignment(
+                    worker=canon,
+                    role=role,
+                    instruction=instruction,
+                    requested_mode=mode,
+                )
             )
 
     if unknowns:
@@ -972,6 +1347,7 @@ def parse_leader_directive(
             role=None,
             unknown_next=", ".join(unknowns),
             assignments=[],
+            marker_found=marker_found,
         )
 
     first = assignments[0] if assignments else None
@@ -982,6 +1358,7 @@ def parse_leader_directive(
         role=first.role if first else None,
         unknown_next=None,
         assignments=assignments,
+        marker_found=marker_found,
     )
 
 
@@ -995,9 +1372,15 @@ def leader_unknown_next_reprompt(
     invalid_next: str,
     workers: list[str],
     default_next: str,
+    marker: str | None = None,
 ) -> str:
     """One-shot correction prompt when NEXT is outside the report pool."""
     pool = ", ".join(workers)
+    marker_line = (
+        f"First line of your reply must be exactly `{marker}` (alone).\n"
+        if marker
+        else ""
+    )
     return (
         f"Turn {turn}/{turns} LEADER HUB (step {step}/{steps}) — NEXT retry.\n"
         f"You are the leader agent `{leader}`.\n"
@@ -1007,11 +1390,32 @@ def leader_unknown_next_reprompt(
         f"You may name one report or a parallel wave: NEXT: a, b\n"
         f"Default NEXT applies ONLY if you omit NEXT entirely: {default_next}\n"
         f"(An explicit invalid NEXT still fails — no silent default fallback.)\n"
-        f"This is your only retry for this step. Reply again with EXACTLY:\n"
-        f"NEXT: <one name or comma wave from: {pool}>\n"
-        f"ROLE: <optional short role label>\n"
-        f"INSTRUCTION: <task for that report / wave>\n"
-        f"STATUS: CONTINUE|DONE|STOP|ESCALATE\n"
+        f"This is your only retry for this step.\n"
+        f"{marker_line}"
+        f"Reply again with the fields NEXT / ROLE / MODE / INSTRUCTION / "
+        f"STATUS (NEXT names only from: {pool}).\n"
+    )
+
+
+def leader_missing_marker_reprompt(
+    *,
+    turn: int,
+    turns: int,
+    step: int,
+    steps: int,
+    leader: str,
+    marker: str,
+    workers: list[str],
+) -> str:
+    """One-shot format retry when the leader reply lacks the step marker."""
+    pool = ", ".join(workers)
+    return (
+        f"Turn {turn}/{turns} LEADER HUB (step {step}/{steps}) — format retry.\n"
+        f"You are the leader agent `{leader}`. Your reply for this step was "
+        f"not found (missing the step marker).\n"
+        f"Reply again. The first line must be exactly `{marker}` on its own "
+        f"line, then the fields NEXT / ROLE / MODE / INSTRUCTION / STATUS "
+        f"(NEXT names only from: {pool}).\n"
     )
 
 
@@ -1021,6 +1425,7 @@ def parse_leader_directive_after_unknown_retry(
     *,
     workers: list[str],
     default_next: str,
+    marker: str | None = None,
 ) -> LeaderDirective:
     """Re-parse after an unknown-NEXT retry; unchanged when no retry needed.
 
@@ -1032,6 +1437,7 @@ def parse_leader_directive_after_unknown_retry(
         retry_text,
         known_agents=workers,
         default_next=default_next,
+        marker=marker,
     )
 
 
@@ -1095,6 +1501,21 @@ def agent_read_text(
     return _truncate_chars(text, max_chars)
 
 
+def resolve_hub_steps_per_turn(requested: int | None, order_len: int) -> int:
+    """Leader steps per turn (default: max(order length, floor), capped)."""
+    if requested is None:
+        steps = max(order_len, HUB_MIN_STEPS_PER_TURN)
+    else:
+        steps = int(requested)
+    if steps < 1:
+        raise RuntimeError("--steps-per-turn must be >= 1")
+    if steps > HUB_MAX_STEPS_PER_TURN:
+        raise RuntimeError(
+            f"--steps-per-turn must be <= {HUB_MAX_STEPS_PER_TURN} (hard cap)"
+        )
+    return steps
+
+
 def leader_briefing_prompt(
     *,
     turn: int,
@@ -1109,40 +1530,63 @@ def leader_briefing_prompt(
     last_agent: str | None,
     last_output: str,
     acceptance: str | None = None,
+    marker: str | None = None,
 ) -> str:
-    """Ask the leader to choose NEXT / INSTRUCTION / STATUS from TUI evidence."""
+    """Ask the leader to choose NEXT / ROLE / MODE / INSTRUCTION / STATUS."""
     workers_s = ", ".join(route.workers)
     order_s = " → ".join(route.order)
     known = ", ".join([route.leader, *route.workers])
     acc = format_acceptance_block(acceptance)
     last_label = last_agent or "(none)"
+    marker_s = marker or hub_directive_marker(turn, step)
     return (
         f"Turn {turn}/{turns} LEADER HUB (step {step}/{steps}).\n"
-        f"You are the leader agent `{route.leader}`.\n"
-        f"You may command at most 3 reports; their roles are NOT fixed — "
-        f"assign duties based on the current goal.\n"
+        f"You are the leader agent `{route.leader}` — run your reports like "
+        f"the manager of a small company.\n"
+        f"Your reports' roles are NOT fixed — assign each report a duty from "
+        f"the org chart below, per step, based on the current goal.\n"
         f"Workdir: {workdir}\n"
         f"Overall goal: {goal}\n"
         f"{acc}"
         f"Report pool (slot names for NEXT): {workers_s}\n"
-        f"Pane labels during the run show detected AI/role "
-        f"(e.g. cursor/検証役); always use slot names in NEXT.\n"
+        f"Pane labels during the run show detected AI/role; always use slot "
+        f"names in NEXT.\n"
         f"Default visitation hint: {order_s}\n"
         f"Default NEXT only if you omit NEXT: {default_next}\n"
         f"(Unknown NEXT outside the report pool gets one retry, then "
         f"fails — no default fallback.)\n"
-        f"Last report: {last_label}\n"
-        f"Reply on screen with EXACTLY these fields:\n"
-        f"NEXT: <one slot, or comma wave e.g. agent-a, agent-b>\n"
-        f"  (2+ names run in PARALLEL, then results merge back to you)\n"
-        f"  (optional: repeat NEXT/ROLE/INSTRUCTION blocks for different "
-        f"duties in the same wave)\n"
-        f"ROLE: <short duty; becomes pane label AI/role>\n"
-        f"INSTRUCTION: <task for that report / shared wave task>\n"
-        f"STATUS: CONTINUE|DONE|STOP|ESCALATE\n"
+        f"Last report(s): {last_label}\n"
+        f"--- Org chart (put the key in ROLE, e.g. qa.review) ---\n"
+        f"{format_hub_org_chart()}\n"
+        f"--- end org chart ---\n"
+        f"Scheduling rules (enforced by the runner):\n"
+        f"- One NEXT block per report; several blocks (or NEXT: a, b) form a "
+        f"wave that starts together.\n"
+        f"- READ duties must not edit the workdir; they run in PARALLEL with "
+        f"each other and with the writer.\n"
+        f"- WRITE duties (開発部, docs.write, or MODE: write) edit files and run "
+        f"ONE AT A TIME in the order you list them.\n"
+        f"- A free-text ROLE without MODE is treated as WRITE (serial). Use a "
+        f"catalog key or MODE: read when the duty only reads.\n"
+        f"- Use parallelism: e.g. implement the next task (dev.implement) while "
+        f"another report reviews/tests what was already implemented "
+        f"(qa.review / qa.test-run) and a third researches or designs the "
+        f"following task.\n"
+        f"- Do not split one coding change across several writers in the same "
+        f"wave.\n"
+        f"Reply format — the first line must be `{marker_s}` on its own line "
+        f"(the runner finds your reply by it), then one block per report:\n"
+        f"  NEXT: <slot name>\n"
+        f"  ROLE: <org chart key, or short duty>\n"
+        f"  MODE: <read|write> (optional for catalog keys)\n"
+        f"  INSTRUCTION: <concrete task; may span lines>\n"
+        f"and finally:\n"
+        f"  STATUS: <CONTINUE|DONE|STOP|ESCALATE>\n"
+        f"(DONE = goal met; STOP = cannot proceed; ESCALATE = owner decision "
+        f"needed — put the question in INSTRUCTION.)\n"
         f"Known agents: {known}\n"
         f"Notes path hint: {notes_dir}/TURN{turn}_LEADER_STEP{step}.md\n"
-        f"--- TUI output from last report (truncated) ---\n"
+        f"--- TUI output from last report(s) (truncated) ---\n"
         f"{last_output.strip() or '_(empty)_'}\n"
         f"--- end ---\n"
         f"Choose who acts next and what role they play from the evidence. "
@@ -1211,6 +1655,24 @@ def format_prior_worker_section(
     )
 
 
+def _hub_mode_guidance(mode: str | None) -> str:
+    if mode == HUB_MODE_READ:
+        return (
+            "MODE: read — READ-ONLY duty. Do NOT create, edit, delete, format "
+            "or git-modify files in the workdir (another report may be editing "
+            "right now). Review/verify the state that was already implemented "
+            "(see prior handoff), run builds/tests if useful, and report "
+            "findings for the leader.\n"
+        )
+    if mode == HUB_MODE_WRITE:
+        return (
+            "MODE: write — you are the only report allowed to edit the workdir "
+            "right now. Read-only reports may inspect the tree concurrently; "
+            "keep changes focused on your INSTRUCTION.\n"
+        )
+    return ""
+
+
 def worker_assignment_prompt(
     *,
     turn: int,
@@ -1226,11 +1688,13 @@ def worker_assignment_prompt(
     prior_agent: str | None = None,
     prior_role: str | None = None,
     prior_summary: str | None = None,
+    mode: str | None = None,
 ) -> str:
     """Forward the leader's instruction to a worker agent.
 
     Includes an explicit prior-worker handoff section (none on step 1;
-    report name / ROLE / summary on later steps).
+    report name / ROLE / summary on later steps) and, when known, the
+    read/write scheduling contract for this assignment.
     """
     role_s = normalize_hub_role(role)
     if role_s:
@@ -1239,6 +1703,11 @@ def worker_assignment_prompt(
             f"(not a fixed job title — this step only).\n"
             f"ROLE: {role_s}\n"
         )
+        spec = lookup_hub_role(role_s)
+        if spec is not None:
+            role_line += (
+                f"Department: {spec.department} / {spec.title} — {spec.duty}\n"
+            )
     else:
         role_line = (
             f"From leader `{leader}`. Your role is whatever INSTRUCTION says "
@@ -1254,6 +1723,7 @@ def worker_assignment_prompt(
         f"Turn {turn}/{turns} REPORT assignment "
         f"(step {step}/{steps} → you are `{worker}`).\n"
         f"{role_line}"
+        f"{_hub_mode_guidance(mode)}"
         f"Workdir: {workdir}\n"
         f"Overall goal: {goal}\n"
         f"{handoff}"
@@ -1263,25 +1733,54 @@ def worker_assignment_prompt(
     )
 
 
+def _tail_chars(text: str, max_chars: int) -> str:
+    """Keep the last *max_chars* (latest outcome), starting at a line edge."""
+    body = (text or "").strip()
+    if max_chars <= 0 or len(body) <= max_chars:
+        return body
+    tail = body[-max_chars:]
+    nl = tail.find("\n")
+    if 0 <= nl < 80:
+        tail = tail[nl + 1 :]
+    return "…(truncated)\n" + tail.lstrip()
+
+
 def format_wave_prior_summary(
     results: list[tuple[HubAssignment, str]],
+    *,
+    max_chars: int | None = None,
 ) -> str:
-    """Combine parallel worker screens into one prior-handoff blob."""
+    """Combine wave worker screens into one blob for the leader / next step.
+
+    With *max_chars*, each worker keeps an equal share (at least
+    ``HUB_LEADER_EVIDENCE_MIN_PER_WORKER``) of its screen tail, so a parallel
+    wave cannot crowd out earlier members or blow up the next prompt.
+    """
     if not results:
         return "_(empty wave)_"
+    per_worker: int | None = None
+    if max_chars is not None:
+        per_worker = max(
+            HUB_LEADER_EVIDENCE_MIN_PER_WORKER, max_chars // len(results)
+        )
+
+    def _body(screen: str) -> str:
+        text = (screen or "").strip()
+        if per_worker is not None:
+            text = _tail_chars(text, per_worker)
+        return text or "_(empty)_"
+
+    def _head(assignment: HubAssignment) -> str:
+        role = normalize_hub_role(assignment.role) or "_(none)_"
+        mode = f" MODE `{assignment.mode}`" if assignment.mode else ""
+        return f"`{assignment.worker}` ROLE `{role}`{mode}"
+
     if len(results) == 1:
         assignment, screen = results[0]
-        role = normalize_hub_role(assignment.role) or "_(none)_"
-        body = (screen or "").strip() or "_(empty)_"
-        return f"`{assignment.worker}` ROLE `{role}`:\n{body}"
-    parts: list[str] = []
-    for assignment, screen in results:
-        role = normalize_hub_role(assignment.role) or "_(none)_"
-        body = (screen or "").strip() or "_(empty)_"
-        parts.append(
-            f"### `{assignment.worker}` ROLE `{role}`\n{body}"
-        )
-    return "\n\n".join(parts)
+        return f"{_head(assignment)}:\n{_body(screen)}"
+    return "\n\n".join(
+        f"### {_head(assignment)}\n{_body(screen)}" for assignment, screen in results
+    )
 
 
 def canonicalize_hub_assignments(
@@ -1290,7 +1789,7 @@ def canonicalize_hub_assignments(
     workers: list[str],
     goal: str,
 ) -> list[HubAssignment]:
-    """Validate/fill instructions for a wave; preserve order."""
+    """Validate/fill instructions and read/write mode for a wave."""
     by_key = {w.casefold(): w for w in workers}
     out: list[HubAssignment] = []
     seen: set[str] = set()
@@ -1312,9 +1811,18 @@ def canonicalize_hub_assignments(
                 f"Continue the overall goal ({goal}) from your role "
                 f"`{worker}`. Leave a clear on-screen summary when done."
             )
+        mode = resolve_hub_assignment_mode(
+            role, raw.requested_mode or raw.mode, instruction
+        )
         instruction = prepend_role_to_instruction(instruction, role)
         out.append(
-            HubAssignment(worker=worker, role=role, instruction=instruction)
+            HubAssignment(
+                worker=worker,
+                role=role,
+                instruction=instruction,
+                mode=mode,
+                requested_mode=raw.requested_mode,
+            )
         )
     if not out:
         raise RuntimeError("leader hub step has no worker assignments")
@@ -1326,6 +1834,29 @@ def canonicalize_hub_assignments(
     return out
 
 
+def plan_hub_wave(
+    assignments: list[HubAssignment],
+) -> tuple[list[HubAssignment], list[HubAssignment]]:
+    """Split a wave into (serial writers, parallel readers), order preserved.
+
+    Unknown mode counts as a writer so edits are never parallelized by
+    accident.
+    """
+    writers = [a for a in assignments if a.mode != HUB_MODE_READ]
+    readers = [a for a in assignments if a.mode == HUB_MODE_READ]
+    return writers, readers
+
+
+def describe_hub_wave_plan(assignments: list[HubAssignment]) -> str:
+    writers, readers = plan_hub_wave(assignments)
+    parts: list[str] = []
+    if writers:
+        parts.append("serial(write): " + " → ".join(a.worker for a in writers))
+    if readers:
+        parts.append("parallel(read): " + ", ".join(a.worker for a in readers))
+    return " | ".join(parts) or "(empty)"
+
+
 def run_hub_assignment_wave(
     *,
     herdr: str,
@@ -1335,13 +1866,20 @@ def run_hub_assignment_wave(
     dry_run: bool,
     env: dict[str, str | None] | None = None,
 ) -> list[tuple[HubAssignment, str]]:
-    """Run one hub wave: serial if 1 worker, otherwise parallel wait+merge.
+    """Run one hub wave with read/write-aware scheduling.
+
+    * ``write`` assignments (or unknown mode) run one after another in the
+      listed order — never two editors on the shared workdir at once. If one
+      writer fails, later writers are skipped.
+    * ``read`` assignments all start immediately and run in parallel with
+      each other and with the writer chain.
 
     ``build_prompt(assignment) -> str`` builds the worker prompt text.
     Returns results in *assignments* order (not completion order).
     """
     if dry_run:
         out: list[tuple[HubAssignment, str]] = []
+        print(f"leader-hub: wave plan → {describe_hub_wave_plan(assignments)}")
         for assignment in assignments:
             prompt = build_prompt(assignment)
             print(prompt)
@@ -1367,33 +1905,75 @@ def run_hub_assignment_wave(
         return assignment.worker, screen
 
     if len(assignments) == 1:
-        worker, screen = _one(assignments[0])
+        _, screen = _one(assignments[0])
         return [(assignments[0], screen)]
 
+    writers, readers = plan_hub_wave(assignments)
     print(
-        f"leader-hub: parallel wave → "
-        + ", ".join(a.worker for a in assignments),
+        f"leader-hub: wave plan → {describe_hub_wave_plan(assignments)}",
         flush=True,
     )
     screens: dict[str, str] = {}
     errors: list[BaseException] = []
-    with ThreadPoolExecutor(max_workers=len(assignments)) as pool:
-        futures = {pool.submit(_one, a): a for a in assignments}
-        for fut in as_completed(futures):
-            assignment = futures[fut]
-            try:
-                worker, screen = fut.result()
+    screens_lock = threading.Lock()
+
+    def _writer_chain() -> None:
+        for assignment in writers:
+            worker, screen = _one(assignment)
+            with screens_lock:
                 screens[worker] = screen
+
+    def _reader(assignment: HubAssignment) -> None:
+        worker, screen = _one(assignment)
+        with screens_lock:
+            screens[worker] = screen
+
+    jobs: list[tuple[str, Any, tuple[Any, ...]]] = []
+    if writers:
+        jobs.append(
+            ("writers " + "→".join(a.worker for a in writers), _writer_chain, ())
+        )
+    for assignment in readers:
+        jobs.append((assignment.worker, _reader, (assignment,)))
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {pool.submit(fn, *fn_args): label for label, fn, fn_args in jobs}
+        for fut in as_completed(futures):
+            label = futures[fut]
+            try:
+                fut.result()
             except BaseException as err:  # noqa: BLE001 — collect all
                 errors.append(err)
                 print(
-                    f"warning: parallel worker {assignment.worker} failed: "
-                    f"{err}",
+                    f"warning: hub wave job {label} failed: {err}",
                     flush=True,
                 )
     if errors:
         raise errors[0]
     return [(a, screens[a.worker]) for a in assignments]
+
+
+def _write_hub_complete(
+    notes_dir: Path,
+    *,
+    goal: str,
+    route: LeaderHubRoute,
+    turns_range: str,
+    status: str,
+) -> None:
+    complete = notes_dir / "COMPLETE.md"
+    if complete.exists():
+        return
+    complete.write_text(
+        "# Complete\n\n"
+        f"goal: {goal}\n"
+        f"mode: leader-hub\n"
+        f"status: {status}\n"
+        f"leader: {route.leader}\n"
+        f"workers: {', '.join(route.workers)}\n"
+        f"turns: {turns_range}\n"
+        f"notes: see TURN*_HUB.md\n",
+        encoding="utf-8",
+    )
 
 
 def run_leader_hub_turns(
@@ -1406,12 +1986,20 @@ def run_leader_hub_turns(
     route: LeaderHubRoute,
     cli_env: dict[str, str | None] | None = None,
 ) -> int:
-    """Run leader-hub turns: read worker → brief leader → prompt NEXT worker."""
+    """Run leader-hub turns: brief leader → run its wave → feed results back.
+
+    Each turn has up to ``--steps-per-turn`` leader steps (default
+    ``max(report count, HUB_MIN_STEPS_PER_TURN)``). Each step's wave runs
+    ``write`` duties serially and ``read`` duties in parallel.
+    """
     ensure_notes_dir(notes_dir)
     records_notes: list[str] = []
     stop_reason: str | None = None
     exit_code = 0
     acceptance = getattr(args, "acceptance", None)
+    steps = resolve_hub_steps_per_turn(
+        getattr(args, "steps_per_turn", None), len(route.order)
+    )
 
     print(
         "leader-hub: leader="
@@ -1420,9 +2008,9 @@ def run_leader_hub_turns(
         + ",".join(route.workers)
         + " (max "
         + str(MAX_HUB_WORKERS)
-        + "; roles not fixed) order="
+        + "; roles from org chart) order="
         + "→".join(route.order)
-        + " (manual layout; no nest/split)",
+        + f" steps/turn={steps} (manual layout; no nest/split)",
         flush=True,
     )
 
@@ -1460,328 +2048,411 @@ def run_leader_hub_turns(
             slot_to_pane = {}
             pane_kinds = {}
 
+    def _ask_leader(prompt: str) -> str:
+        prompt_and_wait(
+            args.herdr,
+            route.leader,
+            prompt,
+            timeout_ms=args.timeout_ms,
+            env=cli_env,
+        )
+        return agent_read_text(args.herdr, route.leader, env=cli_env)
+
+    def _append_leader_note(path: Path, heading: str, text: str) -> None:
+        prior = path.read_text(encoding="utf-8") if path.is_file() else ""
+        path.write_text(
+            prior.rstrip() + f"\n\n## {heading}\n\n" + text + "\n",
+            encoding="utf-8",
+        )
+
     try:
         for turn in range(start_turn, end_turn + 1):
             hub_path = notes_dir / f"TURN{turn}_HUB.md"
             write_skeleton(hub_path, f"Turn {turn} leader hub")
             steps_log: list[str] = [f"# Turn {turn} leader hub\n"]
+
+            def _flush_log() -> None:
+                hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
+
             last_agent: str | None = None
             last_role: str | None = None
-            last_notes_path: Path | None = None
+            last_handoff: str | None = None
             last_output = (
                 "(start of turn — no worker output yet; "
-                "choose the first worker and give an initial INSTRUCTION)"
+                "choose the first worker(s) and give an initial INSTRUCTION)"
             )
             turn_stopped = False
 
-            for step_index, default_next in enumerate(route.order, start=1):
-                steps = len(route.order)
-                briefing = leader_briefing_prompt(
-                    turn=turn,
-                    turns=end_turn,
-                    step=step_index,
-                    steps=steps,
-                    route=route,
-                    goal=args.goal,
-                    workdir=workdir,
-                    notes_dir=notes_dir,
-                    default_next=default_next,
-                    last_agent=last_agent,
-                    last_output=last_output,
-                    acceptance=acceptance,
-                )
-                step_leader_path = notes_dir / f"TURN{turn}_LEADER_STEP{step_index}.md"
-                print(
-                    f"======== TURN {turn}/{end_turn}: "
-                    f"leader[{step_index}] → {route.leader} ========",
-                    flush=True,
-                )
-                if args.dry_run:
-                    print(briefing)
-                    step_leader_path.write_text(
-                        f"# Turn {turn} leader step {step_index}\n\n"
-                        f"NEXT: {default_next}\n"
-                        f"ROLE: dry-run\n"
-                        f"INSTRUCTION: dry-run placeholder for {default_next}\n"
-                        f"STATUS: CONTINUE\n",
-                        encoding="utf-8",
-                    )
-                    directive = LeaderDirective(
-                        next_agent=default_next,
-                        instruction=f"dry-run placeholder for {default_next}",
-                        status="CONTINUE",
-                        role="dry-run",
-                    )
-                else:
-                    prompt_and_wait(
-                        args.herdr,
-                        route.leader,
-                        briefing,
-                        timeout_ms=args.timeout_ms,
-                        env=cli_env,
-                    )
-                    leader_text = agent_read_text(
-                        args.herdr, route.leader, env=cli_env
-                    )
-                    step_leader_path.write_text(
-                        f"# Turn {turn} leader step {step_index}\n\n{leader_text}\n",
-                        encoding="utf-8",
-                    )
-                    # Validate NEXT against the report pool only (not the leader).
-                    directive = parse_leader_directive(
-                        leader_text,
-                        known_agents=route.workers,
-                        default_next=default_next,
-                    )
-
-                next_display = (
-                    directive.unknown_next
-                    if directive.unknown_next
-                    else (
-                        ", ".join(a.worker for a in directive.assignments)
-                        if directive.assignments
-                        else directive.next_agent
-                    )
-                )
-                steps_log.append(
-                    f"## Step {step_index}\n"
-                    f"- default_next: `{default_next}`\n"
-                    f"- NEXT: `{next_display}`\n"
-                    f"- ROLE: `{directive.role or '_(none)_'}`\n"
-                    f"- STATUS: `{directive.status}`\n"
-                    f"- INSTRUCTION: {directive.instruction or '_(missing)_'}\n"
-                )
-                # One retry when CONTINUE + unknown NEXT (never silently
-                # fall back to default_next).
-                if directive.unknown_next and directive.status == "CONTINUE":
-                    invalid = directive.unknown_next
-                    pool = ", ".join(route.workers)
-                    steps_log.append(
-                        f"- NEXT_ERROR: `{invalid}` outside report pool; "
-                        f"re-prompting once (no default_next fallback)\n"
-                    )
-                    print(
-                        f"warning: leader NEXT {invalid!r} outside report pool "
-                        f"({pool}); re-prompting once",
-                        flush=True,
-                    )
-                    if not args.dry_run:
-                        retry_prompt = leader_unknown_next_reprompt(
-                            turn=turn,
-                            turns=end_turn,
-                            step=step_index,
-                            steps=steps,
-                            leader=route.leader,
-                            invalid_next=invalid,
-                            workers=route.workers,
-                            default_next=default_next,
-                        )
-                        prompt_and_wait(
-                            args.herdr,
-                            route.leader,
-                            retry_prompt,
-                            timeout_ms=args.timeout_ms,
-                            env=cli_env,
-                        )
-                        retry_text = agent_read_text(
-                            args.herdr, route.leader, env=cli_env
-                        )
-                        prior = ""
-                        if step_leader_path.is_file():
-                            prior = step_leader_path.read_text(encoding="utf-8")
-                        step_leader_path.write_text(
-                            prior.rstrip()
-                            + "\n\n## NEXT retry\n\n"
-                            + retry_text
-                            + "\n",
-                            encoding="utf-8",
-                        )
-                        directive = parse_leader_directive_after_unknown_retry(
-                            directive,
-                            retry_text,
-                            workers=route.workers,
-                            default_next=default_next,
-                        )
-                        next_after = (
-                            directive.unknown_next
-                            if directive.unknown_next
-                            else directive.next_agent
-                        )
-                        steps_log.append(
-                            f"- NEXT_AFTER_RETRY: `{next_after}`\n"
-                            f"- ROLE_AFTER_RETRY: "
-                            f"`{directive.role or '_(none)_'}`\n"
-                            f"- STATUS_AFTER_RETRY: `{directive.status}`\n"
-                        )
-                        if directive.unknown_next:
-                            steps_log.append(
-                                f"- NEXT_ERROR_AFTER_RETRY: "
-                                f"`{directive.unknown_next}` still outside "
-                                f"report pool; no default_next fallback\n"
-                            )
-
-                if directive.status in {"DONE", "STOP", "ESCALATE"}:
-                    note = (
-                        f"leader STATUS: {directive.status} at turn {turn} "
-                        f"step {step_index}"
-                    )
-                    records_notes.append(note)
-                    steps_log.append(f"\nStopped: {note}\n")
-                    turn_stopped = True
-                    stop_reason = note
-                    if directive.status == "ESCALATE":
-                        write_needs_owner(
-                            notes_dir,
-                            goal=args.goal,
-                            turn=turn,
-                            why=(
-                                directive.instruction
-                                or "leader STATUS: ESCALATE"
-                            ),
-                        )
-                        exit_code = 1
-                    break
-
-                if directive.unknown_next:
-                    pool = ", ".join(route.workers)
-                    msg = (
-                        f"leader NEXT {directive.unknown_next!r} is outside the "
-                        f"report pool ({pool}) after retry; refusing to fall "
-                        f"back to default NEXT {default_next!r}"
-                    )
-                    print(f"warning: {msg}", flush=True)
-                    hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
-                    raise RuntimeError(msg)
-
-                raw_assignments = list(directive.assignments)
-                if not raw_assignments:
-                    fallback = directive.next_agent or default_next
-                    raw_assignments = [
-                        HubAssignment(
-                            worker=fallback,
-                            role=directive.role,
-                            instruction=directive.instruction,
-                        )
-                    ]
-                for raw in raw_assignments:
-                    if raw.worker.casefold() == route.leader.casefold():
-                        raise RuntimeError(
-                            "leader hub NEXT must name a worker, not the leader"
-                        )
-                wave = canonicalize_hub_assignments(
-                    raw_assignments,
-                    workers=route.workers,
-                    goal=args.goal,
-                )
-
-                prior_summary: str | None = None
-                prior_agent = last_agent if step_index > 1 else None
-                prior_role = last_role if step_index > 1 else None
-                if step_index > 1:
-                    prior_summary = summarize_prior_worker_handoff(
-                        screen_text=last_output,
-                        notes_path=last_notes_path,
-                    )
-
-                if not args.dry_run:
-                    for item in wave:
-                        if item.worker not in slot_to_pane:
-                            continue
-                        pane_id = slot_to_pane[item.worker]
-                        kind = pane_kinds.get(pane_id, "agent")
-                        label = apply_hub_duty_pane_label(
-                            args.herdr,
-                            pane_id,
-                            kind=kind,
-                            role=item.role,
-                            env=cli_env,
-                        )
-                        print(
-                            f"leader-hub: duty label {item.worker} → {label}",
-                            flush=True,
-                        )
-
-                wave_names = ", ".join(a.worker for a in wave)
-                mode = "parallel" if len(wave) > 1 else "serial"
-                print(
-                    f"======== TURN {turn}/{end_turn}: "
-                    f"worker[{step_index}] → {wave_names} ({mode}) ========",
-                    flush=True,
-                )
-
-                def _build_prompt(item: HubAssignment) -> str:
-                    return worker_assignment_prompt(
+            try:
+                for step_index in range(1, steps + 1):
+                    default_next = route.order[(step_index - 1) % len(route.order)]
+                    marker = hub_directive_marker(turn, step_index)
+                    briefing = leader_briefing_prompt(
                         turn=turn,
                         turns=end_turn,
                         step=step_index,
                         steps=steps,
-                        worker=item.worker,
-                        leader=route.leader,
+                        route=route,
                         goal=args.goal,
                         workdir=workdir,
-                        instruction=item.instruction or "",
-                        role=item.role,
-                        prior_agent=prior_agent,
-                        prior_role=prior_role,
-                        prior_summary=prior_summary,
+                        notes_dir=notes_dir,
+                        default_next=default_next,
+                        last_agent=last_agent,
+                        last_output=last_output,
+                        acceptance=acceptance,
+                        marker=marker,
                     )
-
-                wave_results = run_hub_assignment_wave(
-                    herdr=args.herdr,
-                    assignments=wave,
-                    build_prompt=_build_prompt,
-                    timeout_ms=args.timeout_ms,
-                    dry_run=args.dry_run,
-                    env=cli_env,
-                )
-
-                snap_parts = [
-                    f"# Turn {turn} wave step {step_index} ({mode})",
-                    f"workers: {wave_names}",
-                    "",
-                ]
-                for item, screen in wave_results:
-                    role_note = item.role or "_(none)_"
-                    worker_snap = (
-                        notes_dir
-                        / f"TURN{turn}_WORKER_{item.worker}_STEP{step_index}.md"
+                    step_leader_path = (
+                        notes_dir / f"TURN{turn}_LEADER_STEP{step_index}.md"
                     )
-                    worker_snap.write_text(
-                        (
-                            f"# Turn {turn} worker `{item.worker}` "
-                            f"step {step_index}\n"
-                            f"ROLE: {role_note}\n\n"
-                            f"{screen}\n"
-                        ),
-                        encoding="utf-8",
+                    print(
+                        f"======== TURN {turn}/{end_turn}: "
+                        f"leader[{step_index}/{steps}] → {route.leader} ========",
+                        flush=True,
+                    )
+                    if args.dry_run:
+                        print(briefing)
+                        step_leader_path.write_text(
+                            f"# Turn {turn} leader step {step_index}\n\n"
+                            f"{marker}\n"
+                            f"NEXT: {default_next}\n"
+                            f"ROLE: dry-run\n"
+                            f"INSTRUCTION: dry-run placeholder for {default_next}\n"
+                            f"STATUS: CONTINUE\n",
+                            encoding="utf-8",
+                        )
+                        directive = LeaderDirective(
+                            next_agent=default_next,
+                            instruction=f"dry-run placeholder for {default_next}",
+                            status="CONTINUE",
+                            role="dry-run",
+                        )
+                    else:
+                        leader_text = _ask_leader(briefing)
+                        step_leader_path.write_text(
+                            f"# Turn {turn} leader step {step_index}\n\n"
+                            f"{leader_text}\n",
+                            encoding="utf-8",
+                        )
+                        # Validate NEXT against the report pool only.
+                        directive = parse_leader_directive(
+                            leader_text,
+                            known_agents=route.workers,
+                            default_next=default_next,
+                            marker=marker,
+                        )
+                        if not directive.marker_found:
+                            steps_log.append(
+                                f"- MARKER_MISSING: `{marker}` not on screen; "
+                                f"format retry once\n"
+                            )
+                            print(
+                                f"warning: leader reply marker {marker!r} not "
+                                f"found; asking once more",
+                                flush=True,
+                            )
+                            retry_text = _ask_leader(
+                                leader_missing_marker_reprompt(
+                                    turn=turn,
+                                    turns=end_turn,
+                                    step=step_index,
+                                    steps=steps,
+                                    leader=route.leader,
+                                    marker=marker,
+                                    workers=route.workers,
+                                )
+                            )
+                            _append_leader_note(
+                                step_leader_path, "Format retry", retry_text
+                            )
+                            directive = parse_leader_directive(
+                                retry_text,
+                                known_agents=route.workers,
+                                default_next=default_next,
+                                marker=marker,
+                            )
+                            if not directive.marker_found:
+                                steps_log.append(
+                                    "- MARKER_MISSING_AFTER_RETRY: parsed whole "
+                                    "snapshot (may include stale fields)\n"
+                                )
+
+                    next_display = (
+                        directive.unknown_next
+                        if directive.unknown_next
+                        else (
+                            ", ".join(a.worker for a in directive.assignments)
+                            if directive.assignments
+                            else directive.next_agent
+                        )
                     )
                     steps_log.append(
-                        f"- worker `{item.worker}` ROLE `{role_note}` "
-                        f"snapshot → `{worker_snap.name}`\n"
+                        f"## Step {step_index}\n"
+                        f"- default_next: `{default_next}`\n"
+                        f"- NEXT: `{next_display}`\n"
+                        f"- ROLE: `{directive.role or '_(none)_'}`\n"
+                        f"- STATUS: `{directive.status}`\n"
+                        f"- INSTRUCTION: {directive.instruction or '_(missing)_'}\n"
                     )
-                    snap_parts.extend(
-                        [
-                            f"## `{item.worker}` ROLE `{role_note}`",
-                            "",
-                            screen,
-                            "",
-                        ]
-                    )
-                wave_snap = notes_dir / f"TURN{turn}_WAVE_STEP{step_index}.md"
-                wave_snap.write_text("\n".join(snap_parts).rstrip() + "\n", encoding="utf-8")
-                last_notes_path = wave_snap
-                last_output = format_wave_prior_summary(wave_results)
-                last_agent = "+".join(a.worker for a, _ in wave_results)
-                roles = [
-                    normalize_hub_role(a.role) or "_(none)_"
-                    for a, _ in wave_results
-                ]
-                last_role = "+".join(roles)
-                steps_log.append(
-                    f"- wave ({mode}): `{wave_names}` → `{wave_snap.name}`\n"
-                )
+                    # One retry when CONTINUE + unknown NEXT (never silently
+                    # fall back to default_next).
+                    if directive.unknown_next and directive.status == "CONTINUE":
+                        invalid = directive.unknown_next
+                        pool = ", ".join(route.workers)
+                        steps_log.append(
+                            f"- NEXT_ERROR: `{invalid}` outside report pool; "
+                            f"re-prompting once (no default_next fallback)\n"
+                        )
+                        print(
+                            f"warning: leader NEXT {invalid!r} outside report "
+                            f"pool ({pool}); re-prompting once",
+                            flush=True,
+                        )
+                        if not args.dry_run:
+                            retry_text = _ask_leader(
+                                leader_unknown_next_reprompt(
+                                    turn=turn,
+                                    turns=end_turn,
+                                    step=step_index,
+                                    steps=steps,
+                                    leader=route.leader,
+                                    invalid_next=invalid,
+                                    workers=route.workers,
+                                    default_next=default_next,
+                                    marker=marker,
+                                )
+                            )
+                            _append_leader_note(
+                                step_leader_path, "NEXT retry", retry_text
+                            )
+                            directive = parse_leader_directive_after_unknown_retry(
+                                directive,
+                                retry_text,
+                                workers=route.workers,
+                                default_next=default_next,
+                                marker=marker,
+                            )
+                            next_after = (
+                                directive.unknown_next
+                                if directive.unknown_next
+                                else ", ".join(
+                                    a.worker for a in directive.assignments
+                                )
+                                or directive.next_agent
+                            )
+                            steps_log.append(
+                                f"- NEXT_AFTER_RETRY: `{next_after}`\n"
+                                f"- ROLE_AFTER_RETRY: "
+                                f"`{directive.role or '_(none)_'}`\n"
+                                f"- STATUS_AFTER_RETRY: `{directive.status}`\n"
+                            )
+                            if directive.unknown_next:
+                                steps_log.append(
+                                    f"- NEXT_ERROR_AFTER_RETRY: "
+                                    f"`{directive.unknown_next}` still outside "
+                                    f"report pool; no default_next fallback\n"
+                                )
 
-            hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
+                    if directive.status in {"DONE", "STOP", "ESCALATE"}:
+                        note = (
+                            f"leader STATUS: {directive.status} at turn {turn} "
+                            f"step {step_index}"
+                        )
+                        records_notes.append(note)
+                        steps_log.append(f"\nStopped: {note}\n")
+                        turn_stopped = True
+                        stop_reason = note
+                        if directive.status == "ESCALATE":
+                            write_needs_owner(
+                                notes_dir,
+                                goal=args.goal,
+                                turn=turn,
+                                why=(
+                                    directive.instruction
+                                    or "leader STATUS: ESCALATE"
+                                ),
+                            )
+                            exit_code = 1
+                        elif directive.status == "DONE":
+                            _write_hub_complete(
+                                notes_dir,
+                                goal=args.goal,
+                                route=route,
+                                turns_range=f"{start_turn}-{turn}",
+                                status=f"DONE (leader, turn {turn} step {step_index})",
+                            )
+                        break
+
+                    if directive.unknown_next:
+                        pool = ", ".join(route.workers)
+                        msg = (
+                            f"leader NEXT {directive.unknown_next!r} is outside "
+                            f"the report pool ({pool}) after retry; refusing to "
+                            f"fall back to default NEXT {default_next!r}"
+                        )
+                        print(f"warning: {msg}", flush=True)
+                        raise RuntimeError(msg)
+
+                    raw_assignments = list(directive.assignments)
+                    if not raw_assignments:
+                        fallback = directive.next_agent or default_next
+                        raw_assignments = [
+                            HubAssignment(
+                                worker=fallback,
+                                role=directive.role,
+                                instruction=directive.instruction,
+                            )
+                        ]
+                    for raw in raw_assignments:
+                        if raw.worker.casefold() == route.leader.casefold():
+                            raise RuntimeError(
+                                "leader hub NEXT must name a worker, not the leader"
+                            )
+                    wave = canonicalize_hub_assignments(
+                        raw_assignments,
+                        workers=route.workers,
+                        goal=args.goal,
+                    )
+
+                    prior_agent = last_agent if step_index > 1 else None
+                    prior_role = last_role if step_index > 1 else None
+                    prior_summary = last_handoff if step_index > 1 else None
+
+                    if not args.dry_run:
+                        for item in wave:
+                            if item.worker not in slot_to_pane:
+                                continue
+                            pane_id = slot_to_pane[item.worker]
+                            kind = pane_kinds.get(pane_id, "agent")
+                            label = apply_hub_duty_pane_label(
+                                args.herdr,
+                                pane_id,
+                                kind=kind,
+                                role=hub_role_display(item.role),
+                                env=cli_env,
+                            )
+                            print(
+                                f"leader-hub: duty label {item.worker} → {label}",
+                                flush=True,
+                            )
+
+                    wave_names = ", ".join(a.worker for a in wave)
+                    writers, readers = plan_hub_wave(wave)
+                    if len(wave) == 1:
+                        mode = "single"
+                    elif not readers:
+                        mode = "serial"
+                    elif not writers:
+                        mode = "parallel"
+                    else:
+                        mode = "mixed"
+                    print(
+                        f"======== TURN {turn}/{end_turn}: "
+                        f"worker[{step_index}/{steps}] → {wave_names} ({mode}: "
+                        f"{describe_hub_wave_plan(wave)}) ========",
+                        flush=True,
+                    )
+                    steps_log.append(
+                        f"- schedule ({mode}): {describe_hub_wave_plan(wave)}\n"
+                    )
+
+                    def _build_prompt(
+                        item: HubAssignment,
+                        *,
+                        _turn: int = turn,
+                        _step: int = step_index,
+                        _prior_agent: str | None = prior_agent,
+                        _prior_role: str | None = prior_role,
+                        _prior_summary: str | None = prior_summary,
+                    ) -> str:
+                        return worker_assignment_prompt(
+                            turn=_turn,
+                            turns=end_turn,
+                            step=_step,
+                            steps=steps,
+                            worker=item.worker,
+                            leader=route.leader,
+                            goal=args.goal,
+                            workdir=workdir,
+                            instruction=item.instruction or "",
+                            role=item.role,
+                            prior_agent=_prior_agent,
+                            prior_role=_prior_role,
+                            prior_summary=_prior_summary,
+                            mode=item.mode,
+                        )
+
+                    wave_results = run_hub_assignment_wave(
+                        herdr=args.herdr,
+                        assignments=wave,
+                        build_prompt=_build_prompt,
+                        timeout_ms=args.timeout_ms,
+                        dry_run=args.dry_run,
+                        env=cli_env,
+                    )
+
+                    snap_parts = [
+                        f"# Turn {turn} wave step {step_index} ({mode})",
+                        f"workers: {wave_names}",
+                        f"schedule: {describe_hub_wave_plan(wave)}",
+                        "",
+                    ]
+                    for item, screen in wave_results:
+                        role_note = item.role or "_(none)_"
+                        worker_snap = (
+                            notes_dir
+                            / f"TURN{turn}_WORKER_{item.worker}_STEP{step_index}.md"
+                        )
+                        worker_snap.write_text(
+                            (
+                                f"# Turn {turn} worker `{item.worker}` "
+                                f"step {step_index}\n"
+                                f"ROLE: {role_note}\n"
+                                f"MODE: {item.mode or '_(unknown)_'}\n\n"
+                                f"{screen}\n"
+                            ),
+                            encoding="utf-8",
+                        )
+                        steps_log.append(
+                            f"- worker `{item.worker}` ROLE `{role_note}` "
+                            f"MODE `{item.mode}` snapshot → `{worker_snap.name}`\n"
+                        )
+                        snap_parts.extend(
+                            [
+                                f"## `{item.worker}` ROLE `{role_note}` "
+                                f"MODE `{item.mode}`",
+                                "",
+                                screen,
+                                "",
+                            ]
+                        )
+                    wave_snap = notes_dir / f"TURN{turn}_WAVE_STEP{step_index}.md"
+                    wave_snap.write_text(
+                        "\n".join(snap_parts).rstrip() + "\n", encoding="utf-8"
+                    )
+                    # Leader evidence and next handoff keep every wave member
+                    # (each gets an equal share of the tail), so parallel
+                    # results are not crowded out by the last worker.
+                    last_output = format_wave_prior_summary(
+                        wave_results, max_chars=HUB_LEADER_EVIDENCE_MAX_CHARS
+                    )
+                    last_handoff = format_wave_prior_summary(
+                        wave_results,
+                        max_chars=HUB_PRIOR_HANDOFF_MAX_CHARS
+                        * min(len(wave_results), 3),
+                    )
+                    last_agent = "+".join(a.worker for a, _ in wave_results)
+                    last_role = "+".join(
+                        normalize_hub_role(a.role) or "_(none)_"
+                        for a, _ in wave_results
+                    )
+                    steps_log.append(
+                        f"- wave ({mode}): `{wave_names}` → `{wave_snap.name}`\n"
+                    )
+                    _flush_log()
+            finally:
+                # Keep the per-turn log even when a step times out or raises.
+                _flush_log()
             if turn_stopped:
                 break
 
@@ -1792,20 +2463,15 @@ def run_leader_hub_turns(
                 f"leader-hub finished turns {start_turn}–{end_turn}",
                 flush=True,
             )
-            # Write a lightweight COMPLETE when the loop exhausted turns without escalate.
+            # Lightweight COMPLETE when turns ran out without escalate/stop.
             if exit_code == 0 and not (notes_dir / "NEEDS_OWNER.md").exists():
-                complete = notes_dir / "COMPLETE.md"
-                if not complete.exists():
-                    complete.write_text(
-                        "# Complete\n\n"
-                        f"goal: {args.goal}\n"
-                        f"mode: leader-hub\n"
-                        f"leader: {route.leader}\n"
-                        f"workers: {', '.join(route.workers)}\n"
-                        f"turns: {start_turn}-{end_turn}\n"
-                        f"notes: see TURN*_HUB.md\n",
-                        encoding="utf-8",
-                    )
+                _write_hub_complete(
+                    notes_dir,
+                    goal=args.goal,
+                    route=route,
+                    turns_range=f"{start_turn}-{end_turn}",
+                    status="turns-exhausted (leader did not report DONE)",
+                )
         if records_notes:
             print("notes: " + "; ".join(records_notes), flush=True)
     finally:
@@ -4097,16 +4763,35 @@ def agent_send_keys(
     herdr_json(herdr, ["agent", "send-keys", target, *keys], env=env)
 
 
+# Serializes focus/Esc/submit across parallel hub workers so concurrent
+# threads do not steal focus from each other mid-submit. Waiting is not locked.
+_AGENT_SUBMIT_LOCK = threading.Lock()
+
+
 def prepare_agent(
     herdr: str,
     target: str,
     *,
     env: dict[str, str | None] | None = None,
+    clear_input: bool = True,
 ) -> None:
+    """Focus *target* and (when safe) press Esc to clear a stale input line.
+
+    Esc is skipped while the agent is ``working`` or ``blocked``: in agent
+    TUIs Esc interrupts a running turn or rejects a permission dialog.
+    """
     try:
         agent_focus(herdr, target, env=env)
     except RuntimeError:
         pass
+    if not clear_input:
+        return
+    try:
+        status = agent_status(herdr, target, env=env)
+    except RuntimeError:
+        status = None
+    if status in {"working", "blocked"}:
+        return
     try:
         agent_send_keys(herdr, target, "esc", env=env)
     except RuntimeError:
@@ -4131,8 +4816,9 @@ def prompt_and_wait(
 
     Avoids agent_prompt_stalled from --wait's short activity window.
     """
-    prepare_agent(herdr, target, env=env)
-    herdr_json(herdr, ["agent", "prompt", target, text], env=env)
+    with _AGENT_SUBMIT_LOCK:
+        prepare_agent(herdr, target, env=env)
+        herdr_json(herdr, ["agent", "prompt", target, text], env=env)
     deadline = time.monotonic() + (timeout_ms / 1000.0)
     saw_work = False
     idle_ticks = 0
@@ -4145,7 +4831,8 @@ def prompt_and_wait(
                 try_auto_yes_for_target(herdr, target, env=env)
         elif status in {"idle", "done"}:
             if saw_work:
-                prepare_agent(herdr, target, env=env)
+                with _AGENT_SUBMIT_LOCK:
+                    prepare_agent(herdr, target, env=env)
                 return
             idle_ticks += 1
             if idle_ticks == 8:
@@ -4154,7 +4841,8 @@ def prompt_and_wait(
                 except RuntimeError:
                     pass
             if idle_ticks >= DEFAULT_IDLE_GRACE and not saw_work:
-                prepare_agent(herdr, target, env=env)
+                with _AGENT_SUBMIT_LOCK:
+                    prepare_agent(herdr, target, env=env)
                 return
         time.sleep(poll_seconds)
     raise TimeoutError(
@@ -4185,6 +4873,18 @@ def run_turns(args: argparse.Namespace) -> int:
     # Fresh runs create notes; resume never wipes existing TURN* artifacts.
     ensure_notes_dir(notes_dir)
 
+    if wants_leader_hub(args):
+        # Validate before daemonizing so CLI/menu callers see the error
+        # instead of it landing only in the background log.
+        try:
+            early_route = resolve_leader_hub_route(args)
+            resolve_hub_steps_per_turn(
+                getattr(args, "steps_per_turn", None), len(early_route.order)
+            )
+        except RuntimeError as err:
+            print(str(err), file=sys.stderr)
+            return 2
+
     if args.daemon and not args.dry_run:
         # Rebuild argv from sys.argv[1:] so flags stay faithful.
         return daemonize(sys.argv[1:], notes_dir=notes_dir)
@@ -4192,6 +4892,9 @@ def run_turns(args: argparse.Namespace) -> int:
     if wants_leader_hub(args):
         try:
             hub_route = resolve_leader_hub_route(args)
+            resolve_hub_steps_per_turn(
+                getattr(args, "steps_per_turn", None), len(hub_route.order)
+            )
         except RuntimeError as err:
             print(str(err), file=sys.stderr)
             return 2
@@ -4769,6 +5472,12 @@ def run_turns(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def default_turn_init_names(count: int) -> list[str]:
+    """``boss`` plus ``agent-a``… for a *count*-pane grid."""
+    reports = [f"agent-{chr(ord('a') + i)}" for i in range(max(count - 1, 0))]
+    return ["boss", *reports]
+
+
 def parse_turn_init_names(raw: str) -> list[str]:
     """Parse ``boss,agent-a,agent-b`` into a unique name list (2–4).
 
@@ -4783,6 +5492,15 @@ def parse_turn_init_names(raw: str) -> list[str]:
     if not text:
         # Bare ``/turn-init`` → default leader + 3 reports.
         return list(DEFAULT_TURN_INIT_NAMES)
+    if re.fullmatch(r"\d+", text):
+        # ``turn-init 6`` → boss + agent-a..agent-e (total pane count).
+        count = int(text)
+        if not MIN_PARTICIPANTS <= count <= MAX_TURN_INIT_PANES:
+            raise ValueError(
+                f"turn-init pane count must be {MIN_PARTICIPANTS}–"
+                f"{MAX_TURN_INIT_PANES} (got {count})"
+            )
+        return default_turn_init_names(count)
     names: list[str] = []
     seen: set[str] = set()
     for part in text.replace(" ", ",").split(","):
@@ -4799,9 +5517,9 @@ def parse_turn_init_names(raw: str) -> list[str]:
             f"turn-init needs at least {MIN_PARTICIPANTS} names "
             f"(leader + reports; got {len(names)})"
         )
-    if len(names) > MAX_PARTICIPANTS:
+    if len(names) > MAX_TURN_INIT_PANES:
         raise ValueError(
-            f"turn-init accepts at most {MAX_PARTICIPANTS} names "
+            f"turn-init accepts at most {MAX_TURN_INIT_PANES} names "
             f"(leader + up to {MAX_HUB_WORKERS} reports; got {len(names)})"
         )
     return names
@@ -5149,21 +5867,24 @@ def split_pane(
     direction: str,
     *,
     env: dict[str, str | None] | None = None,
+    ratio: float | None = None,
 ) -> str:
-    """Split *pane_id* and return the new pane id."""
-    payload = herdr_json(
-        herdr,
-        [
-            "pane",
-            "split",
-            "--pane",
-            pane_id,
-            "--direction",
-            direction,
-            "--no-focus",
-        ],
-        env=env,
-    )
+    """Split *pane_id* and return the new pane id.
+
+    *ratio* is the share kept by the existing pane (herdr default 0.5).
+    """
+    cmd = [
+        "pane",
+        "split",
+        "--pane",
+        pane_id,
+        "--direction",
+        direction,
+        "--no-focus",
+    ]
+    if ratio is not None:
+        cmd.extend(["--ratio", f"{ratio:.4f}"])
+    payload = herdr_json(herdr, cmd, env=env)
     result = payload.get("result") if isinstance(payload, dict) else None
     pane = result.get("pane") if isinstance(result, dict) else None
     new_id = pane.get("pane_id") if isinstance(pane, dict) else None
@@ -5174,6 +5895,11 @@ def split_pane(
     return new_id.strip()
 
 
+def turn_init_grid_columns(pane_count: int) -> int:
+    """Column count for a two-row turn-init grid (2 → 2 columns, 8 → 4)."""
+    return max(2, (pane_count + 1) // 2)
+
+
 def split_tab_for_turn_init(
     herdr: str,
     root_pane_id: str,
@@ -5181,28 +5907,35 @@ def split_tab_for_turn_init(
     *,
     env: dict[str, str | None] | None = None,
 ) -> None:
-    """Grow a single-pane tab into *pane_count* panes (2–4).
+    """Grow a single-pane tab into *pane_count* panes (2–8), two rows max.
 
-    Layouts:
+    Columns are created first with equal widths, then the leftmost columns
+    are split down until the count is reached. Visual order (top row
+    left→right, then bottom row) keeps the leader top-left.
+
     - 2: left | right
     - 3: top-left / bottom-left | right
-    - 4: 2x2 (right, then down on left, then down on right)
+    - 4: 2x2
+    - 5–8: 3–4 columns, top row full, bottom row filled from the left
     """
     if pane_count < 2:
         return
-    if pane_count > MAX_PARTICIPANTS:
+    if pane_count > MAX_TURN_INIT_PANES:
         raise ValueError(
             f"turn-init cannot split into {pane_count} panes "
-            f"(max {MAX_PARTICIPANTS})"
+            f"(max {MAX_TURN_INIT_PANES})"
         )
-    right = split_pane(herdr, root_pane_id, "right", env=env)
-    if pane_count == 2:
-        return
-    split_pane(herdr, root_pane_id, "down", env=env)
-    if pane_count == 3:
-        return
-    # pane_count == 4
-    split_pane(herdr, right, "down", env=env)
+    cols = turn_init_grid_columns(pane_count)
+    columns = [root_pane_id]
+    current = root_pane_id
+    for remaining in range(cols, 1, -1):
+        # The split keeps ``1/remaining`` for the existing pane so all
+        # columns end up equal width.
+        ratio = None if remaining == 2 else 1.0 / remaining
+        current = split_pane(herdr, current, "right", env=env, ratio=ratio)
+        columns.append(current)
+    for column in columns[: pane_count - cols]:
+        split_pane(herdr, column, "down", env=env)
 
 
 def build_turn_init_assignments(
@@ -5256,11 +5989,13 @@ def format_turn_init_usage(names: list[str]) -> str:
             f"  1. 各ペインで AI を起動（名前: {', '.join(names)}）",
             f"  2. リーダー `{leader}` にフォーカスして実行:",
             '       herdr-turns /turn-run 3,"目的"',
-            "  3. リーダーは画面に次を返す:",
-            f"       NEXT: <{report_hint}>  # または a, b で並列",
-            "       ROLE: <任意の短い役割>",
+            "  3. リーダーは画面に次を返す（1 行目はランナーが示す識別行）:",
+            "       HUB-DIRECTIVE T1-S1",
+            f"       NEXT: <{report_hint}>  # ブロックを複数書けばウェーブ",
+            "       ROLE: <組織図のキー 例: dev.implement / qa.review>",
             "       INSTRUCTION: <そのステップの作業>",
             "       STATUS: CONTINUE|DONE|STOP|ESCALATE",
+            "     書き込み役（開発部など）は 1 人ずつ、読み取り役は並列で動く",
             "  任意: herdr-turns /auto-yes   # 確認ダイアログを自動 Yes",
             "  詳細: FORK_FEATURES.md",
         ]
@@ -5664,6 +6399,26 @@ AUTO_YES_YN_RE = re.compile(
 )
 
 
+# Confirmations that auto-yes must never approve (destructive / irreversible).
+AUTO_YES_DANGER_RE = re.compile(
+    r"(?i)("
+    r"\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r|"
+    r"git\s+push\s+(?:\S+\s+)*(?:-f\b|--force)|"
+    r"git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f|"
+    r"git\s+branch\s+-D\b|git\s+checkout\s+--\s+\.|"
+    r"\bdrop\s+(?:table|database|schema)\b|\btruncate\s+table\b|"
+    r"\bmkfs\b|\bdd\s+if=|\bshred\b|chmod\s+-R\s+777|"
+    r"--no-verify|\bsudo\b|kubectl\s+delete|terraform\s+(?:apply|destroy)"
+    r")"
+)
+
+
+def auto_yes_dangerous_match(text: str) -> str | None:
+    """Return the matched dangerous fragment in a confirmation, else None."""
+    match = AUTO_YES_DANGER_RE.search(text or "")
+    return match.group(0) if match else None
+
+
 def auto_yes_state_path() -> Path:
     """Path for persisted auto-yes toggle + watcher pid."""
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
@@ -5765,9 +6520,18 @@ def try_auto_yes_for_target(
         return False
     if not looks_like_yes_proceed_prompt(text):
         return False
+    danger = auto_yes_dangerous_match(text)
+    if danger:
+        print(
+            f"auto-yes: NOT approving {target} — dangerous operation "
+            f"detected ({danger!r}); answer it manually",
+            flush=True,
+        )
+        return False
     keys = auto_yes_keys_for_prompt(text)
     try:
-        prepare_agent(herdr, target, env=env)
+        # No Esc here: Esc would dismiss/reject the confirmation dialog and
+        # the Yes keys would then be typed into the input box instead.
         agent_send_keys(herdr, target, *keys, env=env)
     except RuntimeError:
         return False
