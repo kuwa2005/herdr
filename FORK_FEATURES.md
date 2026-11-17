@@ -5,7 +5,10 @@
 対象ランナー: `scripts/herdr-turns` → `scripts/herdr_agent_turns.py`
 
 ```bash
-# 一度だけ（または更新後）
+# 推奨: 公式インストーラ（herdr 本体 + herdr-turns 一式）
+curl -fsSL https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/install.sh | sh
+
+# またはリポジトリ checkout から手動
 install -m 755 scripts/herdr-turns ~/.local/bin/herdr-turns
 install -m 755 scripts/herdr_agent_turns.py ~/.local/bin/herdr_agent_turns.py
 install -m 644 scripts/herdr_turns_constraints.default.md ~/.local/bin/herdr_turns_constraints.default.md

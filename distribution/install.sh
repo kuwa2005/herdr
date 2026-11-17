@@ -3,6 +3,8 @@ set -eu
 
 BIN="herdr"
 MANIFEST_URL="https://raw.githubusercontent.com/kuwa2005/herdr/master/distribution/latest.json"
+# Fork helper scripts ship from the same branch as the install manifest.
+SCRIPTS_BASE_URL="https://raw.githubusercontent.com/kuwa2005/herdr/master/scripts"
 INSTALL_DIR="${HERDR_INSTALL_DIR:-$HOME/.local/bin}"
 
 main() {
@@ -115,6 +117,17 @@ main() {
 
     log "installed ${BIN} to ${INSTALL_DIR}/${BIN}"
 
+    # Fork multi-agent helpers (leader-hub / herdr-turns). Same directory as herdr.
+    log "installing herdr-turns helpers..."
+    install_helper_script "herdr-turns" 755
+    install_helper_script "herdr_agent_turns.py" 755
+    install_helper_script "herdr_turns_constraints.default.md" 644
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found — herdr-turns needs python3 on PATH"
+    else
+        log "installed herdr-turns to ${INSTALL_DIR}/herdr-turns"
+    fi
+
     # check PATH
     case ":${PATH}:" in
         *":${INSTALL_DIR}:"*) ;;
@@ -140,6 +153,21 @@ main() {
 log()  { printf '  \033[32m>\033[0m %s\n' "$1"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
 err()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; exit 1; }
+
+install_helper_script() {
+    name="$1"
+    mode="$2"
+    dest="${INSTALL_DIR}/${name}"
+    url="${SCRIPTS_BASE_URL}/${name}"
+    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 "$url" -o "${TMP}/${name}"; then
+        err "download failed from ${url}"
+    fi
+    if [ ! -s "${TMP}/${name}" ]; then
+        err "downloaded empty helper script: ${name}"
+    fi
+    mv "${TMP}/${name}" "$dest"
+    chmod "$mode" "$dest"
+}
 
 need() {
     if ! command -v "$1" >/dev/null 2>&1; then

@@ -53,15 +53,25 @@ esac
 : > "$FAKE_CURL_MARKER"
 out=""
 previous=""
+url=""
 for argument in "$@"; do
+  case "$argument" in
+    http://*|https://*) url="$argument" ;;
+  esac
   if [ "$previous" = "-o" ]; then
     out="$argument"
-    break
   fi
   previous="$argument"
 done
 if [ -n "$out" ]; then
-  cp "$FAKE_PAYLOAD" "$out"
+  case "$url" in
+    */herdr-turns|*/herdr_agent_turns.py|*/herdr_turns_constraints.default.md)
+      printf 'fake-helper:%s\n' "$(basename "$url")" > "$out"
+      ;;
+    *)
+      cp "$FAKE_PAYLOAD" "$out"
+      ;;
+  esac
 else
   cat "$FAKE_MANIFEST"
 fi
@@ -156,6 +166,11 @@ exec {sha256sum} "$@"
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((self.install_dir / "herdr").read_bytes(), self.payload.read_bytes())
+                self.assertTrue((self.install_dir / "herdr-turns").is_file())
+                self.assertTrue((self.install_dir / "herdr_agent_turns.py").is_file())
+                self.assertTrue(
+                    (self.install_dir / "herdr_turns_constraints.default.md").is_file()
+                )
 
     def test_android_is_rejected_before_replacing_existing_binary(self) -> None:
         self.install_dir.mkdir()
@@ -180,6 +195,8 @@ exec {sha256sum} "$@"
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.install_dir / "herdr").read_bytes(), self.payload.read_bytes())
+        self.assertTrue((self.install_dir / "herdr-turns").is_file())
+        self.assertTrue((self.install_dir / "herdr_agent_turns.py").is_file())
 
     def test_checksum_mismatch_does_not_replace_existing_binary(self) -> None:
         self.install_dir.mkdir()
