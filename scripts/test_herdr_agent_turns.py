@@ -3053,6 +3053,90 @@ class LeaderHubRoutingTests(unittest.TestCase):
         )
         self.assertIs(same, ok)
 
+
+    def test_parse_leader_directive_comma_wave(self) -> None:
+        d = turns.parse_leader_directive(
+            "NEXT: alpha, beta\nROLE: 調査\nINSTRUCTION: dig\nSTATUS: CONTINUE\n",
+            known_agents=["alpha", "beta", "gamma"],
+            default_next="alpha",
+        )
+        self.assertEqual(d.next_agent, "alpha")
+        self.assertEqual(
+            [(a.worker, a.role) for a in d.assignments],
+            [("alpha", "調査"), ("beta", "調査")],
+        )
+        self.assertEqual(d.assignments[0].instruction, "dig")
+
+    def test_parse_leader_directive_multi_block_wave(self) -> None:
+        d = turns.parse_leader_directive(
+            (
+                "NEXT: alpha\nROLE: A\nINSTRUCTION: do A\n"
+                "NEXT: beta\nROLE: B\nINSTRUCTION: do B\n"
+                "STATUS: CONTINUE\n"
+            ),
+            known_agents=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertEqual(
+            [(a.worker, a.role, a.instruction) for a in d.assignments],
+            [("alpha", "A", "do A"), ("beta", "B", "do B")],
+        )
+
+    def test_parse_leader_directive_wave_unknown_member(self) -> None:
+        d = turns.parse_leader_directive(
+            "NEXT: alpha, ghost\nSTATUS: CONTINUE\n",
+            known_agents=["alpha", "beta"],
+            default_next="alpha",
+        )
+        self.assertEqual(d.unknown_next, "ghost")
+        self.assertEqual(d.assignments, [])
+        self.assertIsNone(d.next_agent)
+
+    def test_run_hub_assignment_wave_parallel_mock(self) -> None:
+        calls: list[str] = []
+
+        def fake_prompt_and_wait(
+            herdr, target, text, *, timeout_ms, env=None, poll_seconds=1.0
+        ):
+            del herdr, text, timeout_ms, env, poll_seconds
+            calls.append(f"prompt:{target}")
+
+        def fake_read(
+            herdr, target, *, source="detection", lines=80, max_chars=6000, env=None
+        ):
+            del herdr, source, lines, max_chars, env
+            return f"screen-{target}"
+
+        wave = [
+            turns.HubAssignment("a", "RA", "ia"),
+            turns.HubAssignment("b", "RB", "ib"),
+        ]
+        with mock.patch.object(
+            turns, "prompt_and_wait", side_effect=fake_prompt_and_wait
+        ), mock.patch.object(turns, "agent_read_text", side_effect=fake_read):
+            results = turns.run_hub_assignment_wave(
+                herdr="herdr",
+                assignments=wave,
+                build_prompt=lambda a: f"P:{a.worker}",
+                timeout_ms=1000,
+                dry_run=False,
+            )
+        self.assertEqual([a.worker for a, _ in results], ["a", "b"])
+        self.assertEqual(results[0][1], "screen-a")
+        self.assertEqual(set(calls), {"prompt:a", "prompt:b"})
+
+    def test_format_wave_prior_summary(self) -> None:
+        summary = turns.format_wave_prior_summary(
+            [
+                (turns.HubAssignment("a", "調査", "x"), "outA"),
+                (turns.HubAssignment("b", "実装", "y"), "outB"),
+            ]
+        )
+        self.assertIn("`a`", summary)
+        self.assertIn("`b`", summary)
+        self.assertIn("outA", summary)
+        self.assertIn("調査", summary)
+
     def test_wants_leader_hub_and_nested_disabled(self) -> None:
         hub = self._ns(leader="boss", participants=["a"])
         hub.from_here = True
@@ -3326,6 +3410,7 @@ class TurnInitTests(unittest.TestCase):
         self.assertIn("使い方:", usage)
         self.assertIn('/turn-run 3,"目的"', usage)
         self.assertIn("NEXT: <agent-a|agent-b>", usage)
+        self.assertIn("並列", usage)
         self.assertIn("ROLE:", usage)
         self.assertIn("/auto-yes", usage)
 

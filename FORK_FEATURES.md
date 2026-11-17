@@ -25,10 +25,11 @@ Herdr 管理ペイン内では `HERDR_ENV=1` / `HERDR_PANE_ID` が付きます�
 - リーダー 1 名 + 部下（reports）最大 3 名（合計最大 4）
 - **部下の役割は固定しない**（名前は身分だけ。毎回リーダーが `ROLE` / `INSTRUCTION` で役割と作業を割り当てる）
 - 流れ: 部下の TUI を読む → リーダーへ渡す → `NEXT` / `ROLE` / `INSTRUCTION` / `STATUS` → 指名した部下へ投入
-- ステップ 2 以降は直前部下の要約（prior handoff）を次の部下へ渡す
+- **ウェーブ並列**: `NEXT: agent-a, agent-b`（または NEXT ブロック複数）で 2 人以上を**同時実行**し、全員完了後に結果をまとめてリーダーへ戻す（合流は直列）
+- ステップ 2 以降は直前ステップ（単一またはウェーブ）の要約（prior handoff）を次へ渡す
 
 ```text
-部下ペイン (最大3) -- read --> リーダー -- NEXT/ROLE/INSTRUCTION --> 次の部下
+部下ペイン (最大3) -- read --> リーダー -- NEXT/ROLE/INSTRUCTION --> 部下（1人=直列 / 複数=並列）
                                       \-- prior handoff (前ステップ要約) --/
 ```
 
@@ -116,11 +117,32 @@ INSTRUCTION: 差分を見て問題を列挙して
 STATUS: CONTINUE
 ```
 
+並列ウェーブ例:
+
+```text
+NEXT: agent-a, agent-b
+ROLE: 調査
+INSTRUCTION: フロントと API を分担して現状を洗い出す
+STATUS: CONTINUE
+```
+
+役割を分けた並列例:
+
+```text
+NEXT: agent-a
+ROLE: 調査フロント
+INSTRUCTION: UI の問題を列挙
+NEXT: agent-b
+ROLE: 調査API
+INSTRUCTION: エンドポイントの問題を列挙
+STATUS: CONTINUE
+```
+
 | フィールド | 必須 | 意味 |
 | --- | --- | --- |
-| `NEXT` | 推奨 | report pool 内の名前。**省略時のみ** `--order` の default を使う。pool 外の名前は **警告のうえ fail**（default へフォールバックしない） |
-| `ROLE` | 任意 | 短い役割ラベル。worker prompt / `TURN*_HUB` / worker notes に記録。INSTRUCTION 先頭に役割が無ければ `ROLE: …` を前置して部下へ渡す |
-| `INSTRUCTION` | 推奨 | そのステップの作業内容 |
+| `NEXT` | 推奨 | report pool 内の名前。カンマ区切りで**並列ウェーブ**（例: `agent-a, agent-b`）。NEXT ブロックを複数書けば役割・指示を分けられる。**省略時のみ** `--order` の default（1 人）。pool 外は **警告のうえ fail** |
+| `ROLE` | 任意 | 短い役割ラベル。ウェーブ共有、または NEXT ブロックごとに個別。pane ラベルが `AI/役割` になる |
+| `INSTRUCTION` | 推奨 | そのステップの作業内容（ウェーブ共有、またはブロックごと） |
 | `STATUS` | 推奨 | `CONTINUE` / `DONE` / `STOP` / `ESCALATE` |
 
 ### pane→agent bind

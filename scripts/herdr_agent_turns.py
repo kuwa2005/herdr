@@ -34,8 +34,9 @@ Manual multi-party (2–4 already-running named agents, no nest/split):
   ``--participant`` reports (subordinates). Roles are **not fixed** —
   the leader assigns duties per goal via ``NEXT`` / ``INSTRUCTION`` /
   ``STATUS``. Each step reads a report's TUI, briefs the leader, then
-  prompts the chosen report. See ``resolve_leader_hub_route`` /
-  ``run_leader_hub_turns``.
+  prompts the chosen report(s). A comma ``NEXT`` wave runs workers in
+  parallel, then merges results before the next leader step. See
+  ``resolve_leader_hub_route`` / ``run_leader_hub_turns``.
 * **Init names**: ``herdr-turns /turn-init`` (defaults to
   ``boss,agent-a,agent-b,agent-c``) only on a **single-pane** tab; it
   splits to a grid then renames panes in visual order.
@@ -68,6 +69,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -181,16 +183,42 @@ class LeaderHubRoute:
 
 
 @dataclass
+class HubAssignment:
+    """One worker task inside a leader-hub step (wave may have 1..N)."""
+
+    worker: str
+    role: str | None = None
+    instruction: str | None = None
+
+
+@dataclass
 class LeaderDirective:
-    """Parsed leader reply fields for one hub step."""
+    """Parsed leader reply fields for one hub step.
+
+    ``assignments`` is the wave to run (1 = serial, 2+ = parallel then merge).
+    ``next_agent`` / ``role`` / ``instruction`` mirror the first assignment for
+    backward-compatible callers and tests.
+    """
 
     next_agent: str | None
     instruction: str | None
     status: str  # CONTINUE | DONE | STOP | ESCALATE
     role: str | None = None  # optional short ROLE: label from leader
-    # Set when NEXT was present but not in the allowed report pool.
+    # Set when NEXT was present but outside the allowed report pool.
     # Callers must NOT fall back to default_next when this is set.
     unknown_next: str | None = None
+    assignments: list[HubAssignment] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.assignments or self.unknown_next or not self.next_agent:
+            return
+        self.assignments = [
+            HubAssignment(
+                worker=self.next_agent,
+                role=self.role,
+                instruction=self.instruction,
+            )
+        ]
 
 
 @dataclass
@@ -707,7 +735,7 @@ def multiparty_handoff_prompt(
     )
 
 
-LEADER_NEXT_RE = re.compile(r"(?im)^\s*NEXT\s*:\s*(\S+)\s*$")
+LEADER_NEXT_RE = re.compile(r"(?im)^\s*NEXT\s*:\s*(.+?)\s*$")
 LEADER_STATUS_RE = re.compile(
     r"(?im)^\s*STATUS\s*:\s*(CONTINUE|DONE|STOP|ESCALATE)\s*$"
 )
@@ -817,6 +845,35 @@ def prepend_role_to_instruction(instruction: str, role: str | None) -> str:
     return f"ROLE: {role_s}\n{body}"
 
 
+def split_hub_next_names(raw: str) -> list[str]:
+    """Split a NEXT value into one or more report names (comma-separated)."""
+    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
+
+
+def _extract_instruction_from_block(block: str) -> str | None:
+    """Pull INSTRUCTION (multi-line) from a NEXT block body."""
+    instr_m = LEADER_INSTRUCTION_LINE_RE.search(block)
+    if not instr_m:
+        return None
+    first = instr_m.group(1).strip()
+    rest_lines: list[str] = []
+    if first:
+        rest_lines.append(first)
+    for line in block[instr_m.end() :].splitlines():
+        if re.match(
+            r"(?i)^\s*(NEXT|STATUS|INSTRUCTION|ROLE|VERDICT|TASK|DONE_WHEN)\s*:",
+            line,
+        ):
+            break
+        rest_lines.append(line.rstrip())
+    return "\n".join(rest_lines).strip() or None
+
+
+def _extract_role_from_block(block: str) -> str | None:
+    role_m = LEADER_ROLE_RE.search(block)
+    return normalize_hub_role(role_m.group(1) if role_m else None)
+
+
 def parse_leader_directive(
     text: str,
     *,
@@ -825,59 +882,106 @@ def parse_leader_directive(
 ) -> LeaderDirective:
     """Extract NEXT / ROLE / INSTRUCTION / STATUS from a leader pane snapshot.
 
-    ``ROLE`` is optional (short label). Missing ROLE yields ``role=None``.
+    ``NEXT`` may list one name, a comma wave (``a, b``), or appear multiple
+    times with per-block ROLE/INSTRUCTION. A wave of 2+ workers runs in
+    parallel and merges before the next leader step.
 
     ``NEXT`` omitted → fall back to ``default_next`` when provided.
-    ``NEXT`` present but outside ``known_agents`` (report pool) →
-    ``unknown_next`` is set and ``next_agent`` stays ``None``. Callers must
-    **not** substitute ``default_next`` in that case (warn or fail instead).
+    Any name outside ``known_agents`` → ``unknown_next`` set; no default
+    fallback for that step.
     """
     body = text or ""
     status_m = LEADER_STATUS_RE.search(body)
     status = status_m.group(1).upper() if status_m else "CONTINUE"
+    by_key = {a.casefold(): a for a in known_agents}
 
-    next_m = LEADER_NEXT_RE.search(body)
-    next_raw = next_m.group(1).strip() if next_m else None
-    next_agent: str | None = None
-    unknown_next: str | None = None
-    if next_raw:
-        by_key = {a.casefold(): a for a in known_agents}
-        canon = by_key.get(next_raw.casefold())
-        if canon is not None:
-            next_agent = canon
-        else:
-            # Explicit unknown — do NOT fall back to default_next.
-            unknown_next = next_raw
-    elif default_next is not None:
+    next_matches = list(LEADER_NEXT_RE.finditer(body))
+    assignments: list[HubAssignment] = []
+    unknowns: list[str] = []
+
+    def resolve_name(raw_name: str) -> str | None:
+        canon = by_key.get(raw_name.casefold())
+        if canon is None:
+            unknowns.append(raw_name)
+            return None
+        return canon
+
+    if not next_matches:
+        role = _extract_role_from_block(body)
+        instruction = _extract_instruction_from_block(body)
         next_agent = default_next
+        if next_agent is not None:
+            assignments = [
+                HubAssignment(
+                    worker=next_agent, role=role, instruction=instruction
+                )
+            ]
+        return LeaderDirective(
+            next_agent=next_agent,
+            instruction=instruction,
+            status=status,
+            role=role,
+            unknown_next=None,
+            assignments=assignments,
+        )
 
-    role_m = LEADER_ROLE_RE.search(body)
-    role = normalize_hub_role(role_m.group(1) if role_m else None)
+    for index, match in enumerate(next_matches):
+        block_end = (
+            next_matches[index + 1].start()
+            if index + 1 < len(next_matches)
+            else len(body)
+        )
+        block = body[match.end() : block_end]
+        status_cut = re.search(r"(?im)^\s*STATUS\s*:", block)
+        if status_cut:
+            block = block[: status_cut.start()]
+        role = _extract_role_from_block(block)
+        instruction = _extract_instruction_from_block(block)
+        # Single NEXT line may use fields that appeared before it.
+        if len(next_matches) == 1:
+            if role is None:
+                role = _extract_role_from_block(body[: match.start()] + "\n" + block)
+            if instruction is None:
+                instruction = _extract_instruction_from_block(
+                    body[: match.start()] + "\n" + block
+                )
+            if role is None:
+                role = _extract_role_from_block(body)
+            if instruction is None:
+                instruction = _extract_instruction_from_block(body)
+        names = split_hub_next_names(match.group(1))
+        if not names:
+            unknowns.append("(empty)")
+            continue
+        for raw_name in names:
+            canon = resolve_name(raw_name)
+            if canon is None:
+                continue
+            # Dedupe within the wave while preserving order.
+            if any(a.worker.casefold() == canon.casefold() for a in assignments):
+                continue
+            assignments.append(
+                HubAssignment(worker=canon, role=role, instruction=instruction)
+            )
 
-    instruction: str | None = None
-    instr_m = LEADER_INSTRUCTION_LINE_RE.search(body)
-    if instr_m:
-        first = instr_m.group(1).strip()
-        # Collect following lines until a known field header or blank-heavy end.
-        start = instr_m.end()
-        rest_lines: list[str] = []
-        if first:
-            rest_lines.append(first)
-        for line in body[start:].splitlines():
-            if re.match(
-                r"(?i)^\s*(NEXT|STATUS|INSTRUCTION|ROLE|VERDICT|TASK|DONE_WHEN)\s*:",
-                line,
-            ):
-                break
-            rest_lines.append(line.rstrip())
-        instruction = "\n".join(rest_lines).strip() or None
+    if unknowns:
+        return LeaderDirective(
+            next_agent=None,
+            instruction=None,
+            status=status,
+            role=None,
+            unknown_next=", ".join(unknowns),
+            assignments=[],
+        )
 
+    first = assignments[0] if assignments else None
     return LeaderDirective(
-        next_agent=next_agent,
-        instruction=instruction,
+        next_agent=first.worker if first else None,
+        instruction=first.instruction if first else None,
         status=status,
-        role=role,
-        unknown_next=unknown_next,
+        role=first.role if first else None,
+        unknown_next=None,
+        assignments=assignments,
     )
 
 
@@ -898,14 +1002,15 @@ def leader_unknown_next_reprompt(
         f"Turn {turn}/{turns} LEADER HUB (step {step}/{steps}) — NEXT retry.\n"
         f"You are the leader agent `{leader}`.\n"
         f"Your previous NEXT `{invalid_next}` is NOT in the report pool.\n"
-        f"Valid report names (pick exactly one): {pool}\n"
+        f"Valid report names: {pool}\n"
         f"Do not use the leader name or any name outside that list.\n"
+        f"You may name one report or a parallel wave: NEXT: a, b\n"
         f"Default NEXT applies ONLY if you omit NEXT entirely: {default_next}\n"
         f"(An explicit invalid NEXT still fails — no silent default fallback.)\n"
         f"This is your only retry for this step. Reply again with EXACTLY:\n"
-        f"NEXT: <one name from: {pool}>\n"
+        f"NEXT: <one name or comma wave from: {pool}>\n"
         f"ROLE: <optional short role label>\n"
-        f"INSTRUCTION: <task for that report>\n"
+        f"INSTRUCTION: <task for that report / wave>\n"
         f"STATUS: CONTINUE|DONE|STOP|ESCALATE\n"
     )
 
@@ -1028,10 +1133,12 @@ def leader_briefing_prompt(
         f"fails — no default fallback.)\n"
         f"Last report: {last_label}\n"
         f"Reply on screen with EXACTLY these fields:\n"
-        f"NEXT: <one slot name from the report pool>\n"
-        f"ROLE: <short duty for that report; becomes pane label "
-        f"AI/role>\n"
-        f"INSTRUCTION: <task for that report this step>\n"
+        f"NEXT: <one slot, or comma wave e.g. agent-a, agent-b>\n"
+        f"  (2+ names run in PARALLEL, then results merge back to you)\n"
+        f"  (optional: repeat NEXT/ROLE/INSTRUCTION blocks for different "
+        f"duties in the same wave)\n"
+        f"ROLE: <short duty; becomes pane label AI/role>\n"
+        f"INSTRUCTION: <task for that report / shared wave task>\n"
         f"STATUS: CONTINUE|DONE|STOP|ESCALATE\n"
         f"Known agents: {known}\n"
         f"Notes path hint: {notes_dir}/TURN{turn}_LEADER_STEP{step}.md\n"
@@ -1154,6 +1261,139 @@ def worker_assignment_prompt(
         f"Do that work in this pane. When done, leave a clear on-screen summary "
         f"for the leader. Do not commit unless asked.\n"
     )
+
+
+def format_wave_prior_summary(
+    results: list[tuple[HubAssignment, str]],
+) -> str:
+    """Combine parallel worker screens into one prior-handoff blob."""
+    if not results:
+        return "_(empty wave)_"
+    if len(results) == 1:
+        assignment, screen = results[0]
+        role = normalize_hub_role(assignment.role) or "_(none)_"
+        body = (screen or "").strip() or "_(empty)_"
+        return f"`{assignment.worker}` ROLE `{role}`:\n{body}"
+    parts: list[str] = []
+    for assignment, screen in results:
+        role = normalize_hub_role(assignment.role) or "_(none)_"
+        body = (screen or "").strip() or "_(empty)_"
+        parts.append(
+            f"### `{assignment.worker}` ROLE `{role}`\n{body}"
+        )
+    return "\n\n".join(parts)
+
+
+def canonicalize_hub_assignments(
+    assignments: list[HubAssignment],
+    *,
+    workers: list[str],
+    goal: str,
+) -> list[HubAssignment]:
+    """Validate/fill instructions for a wave; preserve order."""
+    by_key = {w.casefold(): w for w in workers}
+    out: list[HubAssignment] = []
+    seen: set[str] = set()
+    for raw in assignments:
+        key = raw.worker.casefold()
+        if key not in by_key:
+            raise RuntimeError(
+                f"leader NEXT {raw.worker!r} is not a known worker "
+                f"(workers: {', '.join(workers)})"
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        worker = by_key[key]
+        role = normalize_hub_role(raw.role)
+        instruction = (raw.instruction or "").strip()
+        if not instruction:
+            instruction = (
+                f"Continue the overall goal ({goal}) from your role "
+                f"`{worker}`. Leave a clear on-screen summary when done."
+            )
+        instruction = prepend_role_to_instruction(instruction, role)
+        out.append(
+            HubAssignment(worker=worker, role=role, instruction=instruction)
+        )
+    if not out:
+        raise RuntimeError("leader hub step has no worker assignments")
+    if len(out) > MAX_HUB_WORKERS:
+        raise RuntimeError(
+            f"leader hub wave accepts at most {MAX_HUB_WORKERS} workers "
+            f"(got {len(out)})"
+        )
+    return out
+
+
+def run_hub_assignment_wave(
+    *,
+    herdr: str,
+    assignments: list[HubAssignment],
+    build_prompt,
+    timeout_ms: int,
+    dry_run: bool,
+    env: dict[str, str | None] | None = None,
+) -> list[tuple[HubAssignment, str]]:
+    """Run one hub wave: serial if 1 worker, otherwise parallel wait+merge.
+
+    ``build_prompt(assignment) -> str`` builds the worker prompt text.
+    Returns results in *assignments* order (not completion order).
+    """
+    if dry_run:
+        out: list[tuple[HubAssignment, str]] = []
+        for assignment in assignments:
+            prompt = build_prompt(assignment)
+            print(prompt)
+            out.append(
+                (
+                    assignment,
+                    f"(dry-run) {assignment.worker} would run: "
+                    f"{assignment.instruction}",
+                )
+            )
+        return out
+
+    def _one(assignment: HubAssignment) -> tuple[str, str]:
+        prompt = build_prompt(assignment)
+        prompt_and_wait(
+            herdr,
+            assignment.worker,
+            prompt,
+            timeout_ms=timeout_ms,
+            env=env,
+        )
+        screen = agent_read_text(herdr, assignment.worker, env=env)
+        return assignment.worker, screen
+
+    if len(assignments) == 1:
+        worker, screen = _one(assignments[0])
+        return [(assignments[0], screen)]
+
+    print(
+        f"leader-hub: parallel wave → "
+        + ", ".join(a.worker for a in assignments),
+        flush=True,
+    )
+    screens: dict[str, str] = {}
+    errors: list[BaseException] = []
+    with ThreadPoolExecutor(max_workers=len(assignments)) as pool:
+        futures = {pool.submit(_one, a): a for a in assignments}
+        for fut in as_completed(futures):
+            assignment = futures[fut]
+            try:
+                worker, screen = fut.result()
+                screens[worker] = screen
+            except BaseException as err:  # noqa: BLE001 — collect all
+                errors.append(err)
+                print(
+                    f"warning: parallel worker {assignment.worker} failed: "
+                    f"{err}",
+                    flush=True,
+                )
+    if errors:
+        raise errors[0]
+    return [(a, screens[a.worker]) for a in assignments]
 
 
 def run_leader_hub_turns(
@@ -1297,7 +1537,11 @@ def run_leader_hub_turns(
                 next_display = (
                     directive.unknown_next
                     if directive.unknown_next
-                    else directive.next_agent
+                    else (
+                        ", ".join(a.worker for a in directive.assignments)
+                        if directive.assignments
+                        else directive.next_agent
+                    )
                 )
                 steps_log.append(
                     f"## Step {step_index}\n"
@@ -1409,26 +1653,26 @@ def run_leader_hub_turns(
                     hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
                     raise RuntimeError(msg)
 
-                worker = directive.next_agent or default_next
-                if worker.casefold() == route.leader.casefold():
-                    raise RuntimeError(
-                        "leader hub NEXT must name a worker, not the leader"
-                    )
-                if worker.casefold() not in {w.casefold() for w in route.workers}:
-                    raise RuntimeError(
-                        f"leader NEXT {worker!r} is not a known worker "
-                        f"(workers: {', '.join(route.workers)})"
-                    )
-                # Canonical spelling
-                worker = next(w for w in route.workers if w.casefold() == worker.casefold())
-                role = normalize_hub_role(directive.role)
-                instruction = (directive.instruction or "").strip()
-                if not instruction:
-                    instruction = (
-                        f"Continue the overall goal ({args.goal}) from your role "
-                        f"`{worker}`. Leave a clear on-screen summary when done."
-                    )
-                instruction = prepend_role_to_instruction(instruction, role)
+                raw_assignments = list(directive.assignments)
+                if not raw_assignments:
+                    fallback = directive.next_agent or default_next
+                    raw_assignments = [
+                        HubAssignment(
+                            worker=fallback,
+                            role=directive.role,
+                            instruction=directive.instruction,
+                        )
+                    ]
+                for raw in raw_assignments:
+                    if raw.worker.casefold() == route.leader.casefold():
+                        raise RuntimeError(
+                            "leader hub NEXT must name a worker, not the leader"
+                        )
+                wave = canonicalize_hub_assignments(
+                    raw_assignments,
+                    workers=route.workers,
+                    goal=args.goal,
+                )
 
                 prior_summary: str | None = None
                 prior_agent = last_agent if step_index > 1 else None
@@ -1439,68 +1683,102 @@ def run_leader_hub_turns(
                         notes_path=last_notes_path,
                     )
 
-                assignment = worker_assignment_prompt(
-                    turn=turn,
-                    turns=end_turn,
-                    step=step_index,
-                    steps=steps,
-                    worker=worker,
-                    leader=route.leader,
-                    goal=args.goal,
-                    workdir=workdir,
-                    instruction=instruction,
-                    role=role,
-                    prior_agent=prior_agent,
-                    prior_role=prior_role,
-                    prior_summary=prior_summary,
-                )
-                duty_label = None
-                if (
-                    not args.dry_run
-                    and worker in slot_to_pane
-                ):
-                    pane_id = slot_to_pane[worker]
-                    kind = pane_kinds.get(pane_id, "agent")
-                    duty_label = apply_hub_duty_pane_label(
-                        args.herdr,
-                        pane_id,
-                        kind=kind,
-                        role=role,
-                        env=cli_env,
-                    )
+                if not args.dry_run:
+                    for item in wave:
+                        if item.worker not in slot_to_pane:
+                            continue
+                        pane_id = slot_to_pane[item.worker]
+                        kind = pane_kinds.get(pane_id, "agent")
+                        label = apply_hub_duty_pane_label(
+                            args.herdr,
+                            pane_id,
+                            kind=kind,
+                            role=item.role,
+                            env=cli_env,
+                        )
+                        print(
+                            f"leader-hub: duty label {item.worker} → {label}",
+                            flush=True,
+                        )
+
+                wave_names = ", ".join(a.worker for a in wave)
+                mode = "parallel" if len(wave) > 1 else "serial"
                 print(
                     f"======== TURN {turn}/{end_turn}: "
-                    f"worker[{step_index}] → {worker}"
-                    + (f" [{duty_label}]" if duty_label else "")
-                    + " ========",
+                    f"worker[{step_index}] → {wave_names} ({mode}) ========",
                     flush=True,
                 )
-                if args.dry_run:
-                    print(assignment)
-                    last_output = f"(dry-run) {worker} would run: {instruction}"
-                else:
-                    prompt_and_wait(
-                        args.herdr,
-                        worker,
-                        assignment,
-                        timeout_ms=args.timeout_ms,
-                        env=cli_env,
+
+                def _build_prompt(item: HubAssignment) -> str:
+                    return worker_assignment_prompt(
+                        turn=turn,
+                        turns=end_turn,
+                        step=step_index,
+                        steps=steps,
+                        worker=item.worker,
+                        leader=route.leader,
+                        goal=args.goal,
+                        workdir=workdir,
+                        instruction=item.instruction or "",
+                        role=item.role,
+                        prior_agent=prior_agent,
+                        prior_role=prior_role,
+                        prior_summary=prior_summary,
                     )
-                    last_output = agent_read_text(args.herdr, worker, env=cli_env)
-                last_agent = worker
-                last_role = role
-                worker_snap = notes_dir / f"TURN{turn}_WORKER_{worker}_STEP{step_index}.md"
-                role_note = role or "_(none)_"
-                worker_snap.write_text(
-                    f"# Turn {turn} worker `{worker}` step {step_index}\n"
-                    f"ROLE: {role_note}\n\n"
-                    f"{last_output}\n",
-                    encoding="utf-8",
+
+                wave_results = run_hub_assignment_wave(
+                    herdr=args.herdr,
+                    assignments=wave,
+                    build_prompt=_build_prompt,
+                    timeout_ms=args.timeout_ms,
+                    dry_run=args.dry_run,
+                    env=cli_env,
                 )
-                last_notes_path = worker_snap
+
+                snap_parts = [
+                    f"# Turn {turn} wave step {step_index} ({mode})",
+                    f"workers: {wave_names}",
+                    "",
+                ]
+                for item, screen in wave_results:
+                    role_note = item.role or "_(none)_"
+                    worker_snap = (
+                        notes_dir
+                        / f"TURN{turn}_WORKER_{item.worker}_STEP{step_index}.md"
+                    )
+                    worker_snap.write_text(
+                        (
+                            f"# Turn {turn} worker `{item.worker}` "
+                            f"step {step_index}\n"
+                            f"ROLE: {role_note}\n\n"
+                            f"{screen}\n"
+                        ),
+                        encoding="utf-8",
+                    )
+                    steps_log.append(
+                        f"- worker `{item.worker}` ROLE `{role_note}` "
+                        f"snapshot → `{worker_snap.name}`\n"
+                    )
+                    snap_parts.extend(
+                        [
+                            f"## `{item.worker}` ROLE `{role_note}`",
+                            "",
+                            screen,
+                            "",
+                        ]
+                    )
+                wave_snap = notes_dir / f"TURN{turn}_WAVE_STEP{step_index}.md"
+                wave_snap.write_text("\n".join(snap_parts).rstrip() + "\n", encoding="utf-8")
+                last_notes_path = wave_snap
+                last_output = format_wave_prior_summary(wave_results)
+                last_agent = "+".join(a.worker for a, _ in wave_results)
+                roles = [
+                    normalize_hub_role(a.role) or "_(none)_"
+                    for a, _ in wave_results
+                ]
+                last_role = "+".join(roles)
                 steps_log.append(
-                    f"- worker `{worker}` ROLE `{role_note}` "
-                    f"snapshot → `{worker_snap.name}`\n"
+                    f"- wave ({mode}): `{wave_names}` → `{wave_snap.name}`\n"
                 )
 
             hub_path.write_text("\n".join(steps_log) + "\n", encoding="utf-8")
@@ -4979,7 +5257,7 @@ def format_turn_init_usage(names: list[str]) -> str:
             f"  2. リーダー `{leader}` にフォーカスして実行:",
             '       herdr-turns /turn-run 3,"目的"',
             "  3. リーダーは画面に次を返す:",
-            f"       NEXT: <{report_hint}>",
+            f"       NEXT: <{report_hint}>  # または a, b で並列",
             "       ROLE: <任意の短い役割>",
             "       INSTRUCTION: <そのステップの作業>",
             "       STATUS: CONTINUE|DONE|STOP|ESCALATE",
